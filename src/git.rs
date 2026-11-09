@@ -40,6 +40,7 @@ impl RefInfo {
     }
 }
 
+#[derive(Clone)]
 pub struct Repo {
     pub root: PathBuf,
 }

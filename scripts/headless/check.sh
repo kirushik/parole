@@ -6,7 +6,8 @@
 set -euo pipefail
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-export XDG_STATE_HOME="$tmp/state" RUNE_PERF_WARN=0
+# REFVIEW_WAIT: a still is taken only once its diff has landed.
+export XDG_STATE_HOME="$tmp/state" RUNE_PERF_WARN=0 REFVIEW_WAIT=1
 bin=${REFVIEW_BIN:-target/debug/refview}
 fixture="$tmp/fixture"
 scripts/fixture.sh "$fixture" > /dev/null
@@ -31,3 +32,18 @@ echo "reviewed after click.json:"
 cat "$XDG_STATE_HOME/refview/reviewed"
 run --scene last --tree out/last.json
 "$bin" "$tmp" --snap out/not-a-repo.png --theme dark 2>&1 | grep -v '^rune:' || true
+
+# The slow path: a git that takes 0.3 s outlasts the wait, so the window says "Reading" and
+# the diff lands later through `poll`. Real time, since the worker runs on the wall clock.
+slow="$tmp/slowbin"
+mkdir -p "$slow"
+printf '#!/bin/sh\nsleep 0.3\nexec %s "$@"\n' "$(command -v git)" > "$slow/git"
+chmod +x "$slow/git"
+for at in early end; do
+    rm -rf "$tmp/state"
+    REFVIEW_WAIT= PATH="$slow:$PATH" "$bin" "$fixture" --realtime --script $here/slow.json --at mark:$at --tree out/slow-$at.json 2>&1 | grep -v '^rune' || true
+done
+grep -q 'Reading' out/slow-early.json || { echo "slow path: no Reading note while git runs"; exit 1; }
+grep -q '4 files' out/slow-end.json || { echo "slow path: the diff never landed"; exit 1; }
+grep -q 'Reading' out/slow-end.json && { echo "slow path: still Reading at the end"; exit 1; }
+echo "slow path ok"

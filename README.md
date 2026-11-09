@@ -59,7 +59,7 @@ It replays [keys.json](scripts/headless/keys.json) and
 
 ## Not done
 
-- Patches are read on the UI thread. Fine for ordinary commits; a very large "All changes"
-  will stall the window while git runs. `rune::Latest` is the way to move it off.
+- git runs on a worker, but the patch is parsed on the UI thread when it lands (a parsed
+  diff can't cross threads), so an enormous "All changes" can still hitch once.
 - No file tree beside the diff, no search, no comments.
 - At most 500 commits are listed per ref.

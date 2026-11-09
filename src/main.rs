@@ -14,14 +14,19 @@ mod reviewed;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use git::{Commit, RefInfo, Repo};
 use reviewed::Reviewed;
-use rune::{App, AppSpec, Cx, El, Key, KeyEvent, ScrollSpec, Tx, col, el, row, text};
-use rune_kit::diff::{DiffMode, DiffState, DiffView, parse};
+use rune::{App, AppSpec, Cx, El, Key, KeyEvent, Latest, ScrollSpec, Tx, col, el, row, text};
+use rune_kit::diff::{DiffMode, DiffState, DiffView, FileDiff, parse};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, SegmentedControl};
 
 const DEFAULT_PATTERNS: &[&str] = &["refs/jail", "refs/devvm"];
+/// How long a selection waits for its patch before the window draws without it. Short enough
+/// to go unnoticed, long enough that an ordinary commit never flashes "Reading".
+/// `REFVIEW_WAIT=1` waits however long it takes, so a headless still always has its diff.
+const QUICK: Duration = Duration::from_millis(20);
 const KEYS: &str = "n / p  commit     j / k  hunk     ] / [  file     s  split     w  wrap     r  reviewed     u  reload";
 
 struct Config {
@@ -70,9 +75,20 @@ struct State {
     items: Vec<Item>,
     sel: usize,
     diff: DiffState,
+    /// The selection's patch, read off the UI thread; the newest request wins. It is parsed
+    /// on the UI thread when it lands: a parsed `FileDiff` can't cross threads.
+    patch: Latest<Result<String, String>>,
+    /// The selection's patch hasn't landed yet.
+    loading: bool,
     reviewed: Reviewed,
     /// Why there is nothing to show, or what went wrong reading the selection.
     error: Option<String>,
+}
+
+/// What the worker reads.
+enum Target {
+    Commit(String),
+    Range(RefInfo),
 }
 
 impl State {
@@ -84,6 +100,8 @@ impl State {
             items: Vec::new(),
             sel: 0,
             diff: DiffState::new(Vec::new()),
+            patch: Latest::default(),
+            loading: false,
             reviewed: Reviewed::load(),
             error: None,
         };
@@ -138,24 +156,53 @@ impl State {
         }))
     }
 
-    /// Reads the selection's patch into the diff, keeping the layout the reader chose.
-    fn load(&mut self) {
+    /// Swaps in the diff's files, keeping the layout the reader chose.
+    fn show(&mut self, files: Vec<FileDiff>) {
         let (mode, wrap) = (self.diff.mode(), self.diff.wrap());
-        let patch = match (&self.repo, self.selected()) {
-            (Some(repo), Some((_, Some(c)))) => repo.commit_patch(&c.sha),
-            (Some(repo), Some((r, None))) => repo.range_patch(r),
-            _ => Ok(String::new()),
-        };
-        let files = match patch {
-            Ok(p) => parse(&p),
-            Err(e) => {
-                self.error = Some(e);
-                Vec::new()
-            }
-        };
         self.diff = DiffState::new(files);
         self.diff.set_mode(mode);
         self.diff.set_wrap(wrap);
+    }
+
+    /// Asks a worker for the selection's patch. The last selection's diff goes at once, so the
+    /// header never names one commit over another's changes. Most patches are back within
+    /// [`QUICK`] and land before the next frame; a slower one shows "Reading" until `poll`
+    /// takes it.
+    fn load(&mut self) {
+        self.show(Vec::new());
+        let job = match (&self.repo, self.selected()) {
+            (Some(repo), Some((_, Some(c)))) => Some((repo.clone(), Target::Commit(c.sha.clone()))),
+            (Some(repo), Some((r, None))) => Some((repo.clone(), Target::Range(r.clone()))),
+            _ => None,
+        };
+        let Some(job) = job else {
+            self.patch.cancel();
+            self.loading = false;
+            return;
+        };
+        self.loading = true;
+        self.patch.request(job, |(repo, target)| {
+            match target {
+                Target::Commit(sha) => repo.commit_patch(&sha),
+                Target::Range(r) => repo.range_patch(&r),
+            }
+        });
+        let patient = std::env::var_os("REFVIEW_WAIT").is_some_and(|v| !v.is_empty());
+        let until = Instant::now() + QUICK;
+        while !self.land() && (patient || Instant::now() < until) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Takes the worker's answer when there is one; whether it did.
+    fn land(&mut self) -> bool {
+        let Some(answer) = self.patch.take() else { return false };
+        self.loading = false;
+        match answer {
+            Ok(patch) => self.show(parse(&patch)),
+            Err(e) => self.error = Some(e),
+        }
+        true
     }
 
     fn select(&mut self, i: usize, tx: &mut Tx) {
@@ -352,6 +399,8 @@ fn header(s: &State, k: &Kit) -> El {
         .gap(2.0)
         .child(text(title).key("title").font(k.ty.ui_medium).color(k.c.text_base).truncate())
         .child(text(meta).key("meta").font(k.ty.text_small).color(k.c.text_muted).truncate());
+    // No counts while the patch is still on its way: "0 files" would be a claim.
+    let stats = if s.loading { row() } else { stats };
     let top = row().w_full().gap(14.0).items_center().child(titles).child(stats).child(modes.build(k)).child(mark);
     let mut bar = col().key("bar").w_full().px(16.0).py(10.0).gap(8.0).fill(k.c.layer_01).child(top);
     if !message.is_empty() {
@@ -376,6 +425,9 @@ fn body(s: &State, k: &Kit) -> El {
     };
     if let Some(e) = &s.error {
         return note("Couldn't read that", e.clone());
+    }
+    if s.loading {
+        return note("Reading\u{2026}", "git is still producing this diff.".to_owned());
     }
     if s.items.is_empty() {
         let patterns = config().patterns.join(", ");
@@ -434,6 +486,9 @@ fn main() {
             }),
         ],
         on_key: Some(on_key),
+        // The waker runs `poll` when a patch that outlasted `QUICK` lands.
+        setup: Some(|s: &mut State, waker| s.patch.set_waker(waker)),
+        poll: Some(|s: &mut State, _, _| s.land()),
         min_size: Some((760.0, 420.0)),
         families: ("Inter", "ui-monospace, Inter"),
         ..AppSpec::new("refview", (1180.0, 760.0), State::open, view)
