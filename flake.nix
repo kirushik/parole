@@ -32,7 +32,8 @@
     in
     {
       devShells.${system}.default = pkgs.mkShell {
-        nativeBuildInputs = [ rust pkgs.pkg-config ];
+        # git: the app shells out to it, and so do the tests and scripts.
+        nativeBuildInputs = [ rust pkgs.pkg-config pkgs.git ];
         buildInputs = libs;
         LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath libs;
       };

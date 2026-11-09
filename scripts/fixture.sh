@@ -2,11 +2,16 @@
 # Builds a small repository with sandbox-style refs to try refview on:
 #   scripts/fixture.sh /tmp/refview-fixture && cargo run -- /tmp/refview-fixture
 # Dates and authors are fixed, so the commit hashes (and headless snapshots) repeat.
+# Needs GNU sed (`sed -i`).
 set -euo pipefail
 dir=${1:?usage: fixture.sh DIR}
-rm -rf "$dir"
-mkdir -p "$dir"
-cd "$dir"
+# Nothing inherited may point git somewhere other than DIR, or change what it writes there.
+unset $(git rev-parse --local-env-vars)
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_TEMPLATE_DIR
+rm -rf -- "$dir"
+mkdir -p -- "$dir"
+cd -- "$dir"
 
 g() { git -c user.name="$who" -c user.email="$who@example.invalid" -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"; }
 n=0
@@ -18,7 +23,7 @@ commit() {
 }
 
 who=kirushik
-git init -q -b main .
+git init -q -b main --template= .
 mkdir -p src docs
 cat > src/backoff.rs <<'RS'
 use std::time::Duration;
