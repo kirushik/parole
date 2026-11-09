@@ -22,19 +22,25 @@ Nothing a reviewed ref supplies can make git run a program or write a file:
   `--output=FILE`.
 - Diffs are made with `--no-ext-diff --no-textconv --submodule=short`, and signatures are
   never verified (`--no-show-signature`), whatever the repository's config says.
-- A missing object in a partial clone is an error, not a fetch (`GIT_NO_LAZY_FETCH`).
+- A missing object in a partial clone is an error, not a fetch (`GIT_NO_LAZY_FETCH`). Only
+  git 2.46 and later honour that everywhere, so an older git is refused.
+- Replacement objects are ignored (`--no-replace-objects`): a hash shows the commit it names.
 - Commit messages are drawn as text.
 
-`cargo test` builds a repository whose config and ref try each of these and checks that
-nothing ran and nothing was written. See [src/git.rs](src/git.rs).
+`cargo test` builds a repository that tries the forged row, an external diff program, a
+textconv filter and a signature verifier, with controls showing the config is live, and
+checks that no program ran and the forged file wasn't written. The submodule, lazy-fetch and
+replacement flags are passed on every command but have no test of their own. See
+[src/git.rs](src/git.rs).
 
 What it does not defend against: your own git config pointing at something you don't trust,
-and resource exhaustion beyond a 64 MB cap on one command's output (there is no time limit
+and resource exhaustion beyond a 64 MB cap on one command's stdout (there is no time limit
 on a git that hangs).
 
 The list of commits you have marked reviewed lives in `$XDG_STATE_HOME/refview/reviewed`
 (`~/.local/state/refview/reviewed`), one full hash per line, so reviewing writes nothing into
-the repository. A ref rewritten to different commits shows them unread.
+the repository. A ref rewritten to different commits shows them unread. If neither
+`XDG_STATE_HOME` nor `HOME` is an absolute path, marks last only for the run.
 
 ## Use
 
@@ -43,7 +49,7 @@ nix develop             # or put `use flake` in an .envrc and `direnv allow`
 cargo run --release -- ~/path/to/repo
 ```
 
-Needs git 2.31 or later. `refview [DIR] [--refs PATTERN]...`: DIR defaults to the current
+Needs git 2.46 or later. `refview [DIR] [--refs PATTERN]...`: DIR defaults to the current
 directory; `--refs` replaces the default patterns (`refs/jail`, `refs/devvm`), must start
 with `refs/`, and may repeat.
 
@@ -89,5 +95,6 @@ reviewed list. `check.sh` runs the real binary headless against the fixture, rep
 - Dates are in each commit's own timezone.
 - Paths and names that aren't UTF-8 are shown with replacement characters.
 - Two windows marking in the same instant can lose one mark: there is no lock.
-- The reviewed list only grows; delete lines from the file to prune it.
+- The reviewed list is never pruned on its own: hashes of refs long gone stay until you
+  unmark them or delete lines from the file.
 - No file tree beside the diff, no search, no comments.

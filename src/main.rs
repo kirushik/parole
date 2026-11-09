@@ -215,10 +215,13 @@ impl State {
             _ => None,
         };
         let Some(job) = job else {
+            // Nothing to read: an error from listing the refs stays up.
             self.patch.cancel();
             self.loading = false;
             return;
         };
+        // A new read starts clean; the last selection's failure isn't this one's.
+        self.error = None;
         self.loading = true;
         self.patch.request(job, |(repo, target)| {
             match target {
@@ -286,11 +289,18 @@ impl State {
     }
 }
 
-/// A ref with several commits gets an "All changes" row above them; with one, the commit is all.
+/// A ref gets an "All changes" row above its commits, unless that row would show exactly what
+/// its one commit shows: a single commit whose first parent is where the ref left HEAD. (A
+/// lone merge commit is not that: its own diff is against its first parent, the ref's against
+/// HEAD's side.)
 fn items(refs: &[RefInfo]) -> Vec<Item> {
     let mut out = Vec::new();
     for (r, info) in refs.iter().enumerate() {
-        if info.commits.len() > 1 {
+        let same_as_its_commit = match info.commits.as_slice() {
+            [only] => only.parents.first() == info.base.as_ref(),
+            _ => false,
+        };
+        if !info.commits.is_empty() && !same_as_its_commit {
             out.push(Item { r, pick: Pick::All });
         }
         out.extend((0..info.commits.len()).map(|c| Item { r, pick: Pick::Commit(c) }));
@@ -479,6 +489,11 @@ fn body(s: &State, k: &Kit) -> El {
     }
     if s.items.is_empty() {
         let patterns = s.patterns.join(", ");
+        let failed = s.refs.iter().filter(|r| r.error.is_some()).count();
+        if failed > 0 {
+            // Unread is not the same as nothing to read.
+            return note("Couldn't read the refs", format!("{} under {patterns} couldn't be listed; the sidebar says why.", plural(failed, "ref")));
+        }
         let detail = match s.refs.is_empty() {
             true => format!("No refs under {patterns}. Fetch some (jail fetch), then press u."),
             false => format!("Every ref under {patterns} is already in HEAD."),
@@ -571,6 +586,10 @@ mod tests {
 
     fn commit(sha: &str) -> Commit {
         Commit { sha: sha.to_owned(), ..Commit::default() }
+    }
+
+    fn child(sha: &str, parents: &[&str]) -> Commit {
+        Commit { parents: parents.iter().map(|&p| p.to_owned()).collect(), ..commit(sha) }
     }
 
     use crate::git::testing::{build, scratch};
@@ -754,8 +773,11 @@ mod tests {
     fn a_ref_with_one_commit_has_no_all_changes_row() {
         let refs = vec![
             RefInfo { name: "refs/jail/a".into(), commits: vec![commit("1"), commit("2")], ..RefInfo::default() },
-            RefInfo { name: "refs/jail/b".into(), commits: vec![commit("3")], ..RefInfo::default() },
+            RefInfo { name: "refs/jail/b".into(), base: Some("base".into()), commits: vec![child("3", &["base"])], ..RefInfo::default() },
             RefInfo { name: "refs/jail/c".into(), ..RefInfo::default() },
+            // A lone merge whose first parent isn't where the ref left HEAD: its own diff and
+            // the ref's differ, so both rows are offered.
+            RefInfo { name: "refs/jail/d".into(), base: Some("base".into()), commits: vec![child("4", &["side", "base"])], ..RefInfo::default() },
         ];
         assert_eq!(
             items(&refs),
@@ -764,6 +786,8 @@ mod tests {
                 Item { r: 0, pick: Pick::Commit(0) },
                 Item { r: 0, pick: Pick::Commit(1) },
                 Item { r: 1, pick: Pick::Commit(0) },
+                Item { r: 3, pick: Pick::All },
+                Item { r: 3, pick: Pick::Commit(0) },
             ]
         );
     }
