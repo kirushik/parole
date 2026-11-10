@@ -253,6 +253,9 @@ impl State {
         self.sel = i;
         self.error = None;
         self.load();
+        // One commit's diff replaces another's in one frame: nothing of the old one fades or
+        // slides under the new one's header.
+        tx.instant();
         tx.scroll_into_view(item_key(i));
     }
 
@@ -282,8 +285,10 @@ impl State {
         self.notice = self.reviewed.set(&shas, on).err().map(|e| format!("Couldn't save the reviewed list: {e}"));
     }
 
+    /// Lands at once. A spring here moved every line sideways through the other pane's text,
+    /// and no frame on the way was readable.
     fn toggle_split(&mut self, tx: &mut Tx) {
-        tx.motion(rune::tok::motion::SNAPPY);
+        tx.instant();
         let split = self.diff.mode() == DiffMode::Split;
         self.diff.set_mode(if split { DiffMode::Unified } else { DiffMode::Split });
     }
@@ -447,6 +452,7 @@ fn header(s: &State, k: &Kit) -> El {
         .control_size(ControlSize::Regular)
         .on_press_tx(|s: &mut State, tx: &mut Tx| {
             s.toggle_reviewed();
+            tx.instant();
             tx.blur();
         })
         .build(k)
@@ -532,6 +538,10 @@ fn shortcut(t: &str) -> &str {
     }
 }
 
+/// What changes what is shown (another commit, the layout, a mark, the refs) lands in one
+/// frame. Rune animates a key's commit unless told otherwise: old rows fade out under new
+/// ones and kept rows slide, so for a fifth of a second the window showed a diff that never
+/// existed. Hunk and file jumps land at once too, as the kit's reveal already did.
 fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     // Not gated on focus: the window has no text field, and a button that took focus (from a
     // click or Tab) has already had its own keys (Space, Return) by the time this runs.
@@ -540,6 +550,7 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if let Key::Text(t) = &ev.key
         && !(m.cmd || m.ctrl || m.alt)
     {
+        tx.instant();
         match shortcut(t) {
             "n" => s.step(true, tx),
             "p" => s.step(false, tx),
@@ -572,7 +583,11 @@ fn main() {
         on_key: Some(on_key),
         // The waker runs `poll` when a patch that outlasted `QUICK` lands.
         setup: Some(|s: &mut State, waker| s.patch.set_waker(waker)),
-        poll: Some(|s: &mut State, _, _| s.land()),
+        // A diff that arrives late replaces "Reading" in one frame, like one that was quick.
+        poll: Some(|s: &mut State, _, tx: &mut Tx| {
+            tx.instant();
+            s.land()
+        }),
         min_size: Some((760.0, 420.0)),
         families: ("Inter", "ui-monospace, Inter"),
         ..AppSpec::new("refview", (1180.0, 760.0), State::open, view)
@@ -640,6 +655,22 @@ mod tests {
     fn type_key(rt: &mut Runtime<State>, t: &str) {
         rt.key(KeyEvent { key: Key::Text(t.to_owned()), mods: Mods::default() });
         rt.frame(1.0 / 60.0);
+    }
+
+    /// Whether the window is still moving a frame after `t` was typed.
+    fn moves_after(rt: &mut Runtime<State>, t: &str) -> bool {
+        type_key(rt, t);
+        rt.frame(1.0 / 60.0)
+    }
+
+    #[test]
+    fn a_key_lands_in_one_frame() {
+        let (mut rt, dir) = app("one-frame");
+        // Another commit, split, wrap, a mark, back, a hunk, a file: none leaves anything in motion.
+        for t in ["n", "n", "s", "w", "r", "p", "j", "]", "s"] {
+            assert!(!moves_after(&mut rt, t), "still animating a frame after {t:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn subject(s: &State) -> String {
