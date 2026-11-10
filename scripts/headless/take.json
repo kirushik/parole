@@ -1,0 +1,12 @@
+[
+  {"t": 0.2, "type": "type", "text": "n"},
+  {"t": 0.3, "type": "type", "text": "t"},
+  {"t": 0.4, "type": "mark", "name": "blocked"},
+  {"t": 0.5, "type": "key", "name": "Escape"},
+  {"t": 0.6, "type": "type", "text": "r"},
+  {"t": 0.7, "type": "type", "text": "t"},
+  {"t": 0.8, "type": "mark", "name": "confirm"},
+  {"t": 0.9, "type": "key", "name": "Enter"},
+  {"t": 1.2, "type": "mark", "name": "signing"},
+  {"t": 6.0, "type": "mark", "name": "end"}
+]

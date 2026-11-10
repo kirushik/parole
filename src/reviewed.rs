@@ -24,6 +24,11 @@ pub struct Reviewed {
     unsaved: Vec<(String, bool)>,
 }
 
+/// Where refview keeps `name` between runs, when there is an absolute state directory.
+pub fn state_file(name: &str) -> Option<PathBuf> {
+    Some(default_path()?.with_file_name(name))
+}
+
 fn default_path() -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -57,6 +62,11 @@ impl Reviewed {
 
     pub fn has(&self, sha: &str) -> bool {
         self.shas.contains(sha)
+    }
+
+    /// Every hash marked read, as of now.
+    pub fn all(&self) -> BTreeSet<String> {
+        self.shas.clone()
     }
 
     /// Marks `shas` read or unread and saves. The marks hold for this run even when saving fails.

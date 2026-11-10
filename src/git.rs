@@ -1,6 +1,12 @@
-//! Everything refview asks of git. Only commands that read: `rev-parse`, `hash-object` (without
-//! `-w`), `for-each-ref`, `merge-base`, `log`, `show` and `diff`. Nothing is checked out,
-//! merged or built.
+//! Everything refview asks of git. Reviewing only reads: `version`, `rev-parse`, `hash-object`
+//! (without `-w`), `for-each-ref`, `merge-base`, `log`, `show`, `diff`, `rev-list`, `cat-file`,
+//! `check-ref-format` and `symbolic-ref` (to read). Nothing is checked out, merged or built.
+//!
+//! Taking a ref (the last section of [`Repo`]) is the one thing that writes, and only on the
+//! reader's say: `commit-tree -S` makes signed copies of the ref's commits from their existing
+//! trees, and `update-ref` creates one new branch at the last of them. No working tree, index
+//! or existing ref is touched, and no hook of the commit kind runs: nothing is committed the
+//! porcelain way.
 //!
 //! What a reviewed ref controls (file contents, paths, commit messages, author names, its own
 //! `.gitattributes`) must not be able to make git run a program or write a file. So:
@@ -21,9 +27,11 @@
 //! The repository's own config still applies where it can't run anything; prefixes are forced
 //! back to `a/` and `b/` so the patch parses whatever `diff.noprefix` says.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// The most commits listed under one ref.
 pub const MAX_COMMITS: usize = 500;
@@ -248,6 +256,216 @@ impl Repo {
         args.extend(["--end-of-options", base, tip, "--"]);
         self.git(&args)?.ok("diff")
     }
+
+    /// The paths one commit changes against its first parent, with each one's mode after the
+    /// change; deleted files are left out. For marking a commit in the list without reading
+    /// its whole patch.
+    pub fn touched(&self, sha: &str) -> Result<Vec<(String, String)>, String> {
+        let sha = object_id(sha)?;
+        let raw = self
+            .git(&["show", "--format=", "--no-show-signature", "--diff-merges=first-parent", "--root", "--raw", "-z", "--no-renames", "--no-abbrev", "--ignore-submodules=none", "--end-of-options", sha, "--"])?
+            .ok("show")?;
+        Ok(parse_raw(&raw))
+    }
+
+    /// [`Repo::touched`] for everything a ref changes since it left HEAD's history.
+    pub fn touched_range(&self, r: &RefInfo) -> Result<Vec<(String, String)>, String> {
+        let base = object_id(r.base.as_deref().unwrap_or(&self.empty_tree))?;
+        let tip = object_id(&r.tip)?;
+        let raw = self.git(&["diff", "--raw", "-z", "--no-renames", "--no-abbrev", "--ignore-submodules=none", "--end-of-options", base, tip, "--"])?.ok("diff")?;
+        Ok(parse_raw(&raw))
+    }
+
+    // Taking: the part that writes.
+
+    /// Every commit of `r` that HEAD lacks, parents before children: the ones a take copies.
+    /// Read afresh, not from the list on screen, which stops at [`MAX_COMMITS`].
+    pub fn take_list(&self, r: &RefInfo) -> Result<Vec<String>, String> {
+        let tip = object_id(&r.tip)?;
+        let mut args = vec!["rev-list", "--topo-order", "--reverse", "--end-of-options", tip];
+        let not_head;
+        if let Some(head) = self.head()? {
+            not_head = format!("^{head}");
+            args.push(&not_head);
+        }
+        args.push("--");
+        let out = self.git(&args)?.ok("rev-list")?;
+        out.lines().map(|l| object_id(l).map(str::to_owned)).collect()
+    }
+
+    /// The commit object `sha`, as its parts.
+    pub fn raw_commit(&self, sha: &str) -> Result<RawCommit, String> {
+        let sha = object_id(sha)?;
+        let (code, out, err) = run_bytes(&self.dir, &["cat-file", "commit", sha], &Call::default())?;
+        if code != Some(0) {
+            return Err(format!("git cat-file: {}", err.trim()));
+        }
+        // Not lossily: a copy must carry the message it was given, or not be made.
+        let text = String::from_utf8(out).map_err(|_| format!("commit {} isn't UTF-8; it can't be copied faithfully", &sha[..9]))?;
+        let commit = parse_commit(&text).ok_or_else(|| format!("commit {} isn't in a form this can copy", &sha[..9]))?;
+        // The copy is made from these parts, and the review was of what git showed. They must
+        // be the same thing: ask git for its own reading of the tree and parents.
+        let tree = self.git(&["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{sha}^{{tree}}")])?.ok("rev-parse")?;
+        let line = self.git(&["rev-list", "--parents", "--no-walk", "--end-of-options", sha, "--"])?.ok("rev-list")?;
+        let mut ids = line.split_whitespace();
+        if tree.trim() != commit.tree || ids.next() != Some(sha) || !ids.eq(commit.parents.iter().map(String::as_str)) {
+            return Err(format!("git reads commit {} differently from its text; it isn't copied", &sha[..9]));
+        }
+        Ok(commit)
+    }
+
+    /// A signed copy of commit `sha` on `parents`: the same tree, message and author, with the
+    /// committer and signature git's config gives (`user.*`, `user.signingkey`). Returns the
+    /// copy's hash. Waits for the signing program, a key's touch included; `cancel` stops it.
+    pub fn resign(&self, sha: &str, parents: &[String], cancel: &AtomicBool) -> Result<String, String> {
+        let c = self.raw_commit(sha)?;
+        let mut args = vec!["commit-tree", "-S"];
+        for p in parents {
+            args.extend(["-p", object_id(p)?]);
+        }
+        args.push(object_id(&c.tree)?);
+        let call = Call {
+            stdin: Some(c.message.as_bytes()),
+            env: &[("GIT_AUTHOR_NAME", &c.author_name), ("GIT_AUTHOR_EMAIL", &c.author_email), ("GIT_AUTHOR_DATE", &c.author_date)],
+            // A signing wrapper that puts up its own dialog for agent sessions takes this as
+            // its cue. Here the window is the prompt.
+            unset: &["CLAUDECODE"],
+            cancel: Some(cancel),
+        };
+        let (code, out, err) = run_bytes(&self.dir, &args, &call)?;
+        if code != Some(0) {
+            return Err(format!("not signed: {}", err.trim()));
+        }
+        let new = object_id(String::from_utf8_lossy(&out).trim())?.to_owned();
+        // git has no "sign or fail" for commit-tree beyond -S itself; look at what it made.
+        let made = self.raw_commit(&new)?;
+        if !made.signed {
+            return Err("git made the copy without a signature".to_owned());
+        }
+        // The author too: git tidies a name on its way in, and a tidied name is another name.
+        if made.tree != c.tree || made.parents != parents || made.message != c.message || made.author != c.author {
+            return Err(format!("git's signed copy of {} isn't the same commit (its author or message came out changed); it isn't used", &sha[..9]));
+        }
+        Ok(new)
+    }
+
+    /// The commit a local branch points at, or `None` when there is no such branch.
+    pub fn branch_tip(&self, branch: &str) -> Result<Option<String>, String> {
+        let name = self.branch_ref(branch)?;
+        let out = self.git(&["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{name}^{{commit}}")])?;
+        match out.code {
+            Some(0) => Ok(Some(object_id(out.stdout.trim())?.to_owned())),
+            Some(1) => Ok(None),
+            _ => Err(format!("git rev-parse {name}: {}", out.stderr.trim())),
+        }
+    }
+
+    /// `refs/heads/BRANCH`, once git agrees it is a branch name.
+    fn branch_ref(&self, branch: &str) -> Result<String, String> {
+        let name = format!("refs/heads/{branch}");
+        // Also refuses a name starting with `-`.
+        match self.git(&["check-ref-format", "--branch", branch])?.code {
+            Some(0) if !branch.starts_with('-') => Ok(name),
+            _ => Err(format!("{branch:?} isn't a branch name git accepts")),
+        }
+    }
+
+    /// Creates the local branch `branch` at `tip`. Never moves one that exists: git is told
+    /// the branch must not be there, and fails if another process made it meanwhile.
+    pub fn create_branch(&self, branch: &str, tip: &str, from: &str) -> Result<(), String> {
+        let name = self.branch_ref(branch)?;
+        let tip = object_id(tip)?;
+        // A symbolic ref that points nowhere counts as absent below, and would be written
+        // through. Exit 1 is "not a symbolic ref".
+        if self.git(&["symbolic-ref", "--quiet", "--end-of-options", &name])?.code != Some(1) {
+            return Err(format!("{name} is a symbolic ref; it is left alone"));
+        }
+        let absent = "0".repeat(tip.len());
+        let reason = format!("refview: take {from}");
+        self.git(&["update-ref", "--no-deref", "-m", &reason, "--end-of-options", &name, tip, &absent])?.ok("update-ref").map(drop)
+    }
+}
+
+/// A commit object's parts: what a copy of it is made from.
+#[derive(Debug, PartialEq)]
+pub struct RawCommit {
+    pub tree: String,
+    pub parents: Vec<String>,
+    /// The author header as it stands: `Name <email> seconds zone`.
+    pub author: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// `@SECONDS ZONE`, the form git reads back exactly.
+    pub author_date: String,
+    /// Everything after the headers, byte for byte.
+    pub message: String,
+    pub signed: bool,
+}
+
+/// Reads `cat-file commit`: headers, a blank line, the message. Only the shape git itself
+/// writes is accepted: `tree`, then the parents, then `author`, then `committer`, each once
+/// and in that order, then other headers. A commit object can be hand-made with a second
+/// `tree` or a `parent` further down; git ignores those and a naive reader wouldn't, so such
+/// a commit is `None` here, as is one in another text encoding.
+fn parse_commit(text: &str) -> Option<RawCommit> {
+    let (head, message) = text.split_once("\n\n").unwrap_or((text.strip_suffix('\n').unwrap_or(text), ""));
+    let mut lines = head.split('\n').peekable();
+    let tree = lines.next()?.strip_prefix("tree ")?;
+    let mut parents = Vec::new();
+    while let Some(p) = lines.peek().and_then(|l| l.strip_prefix("parent ")) {
+        parents.push(p.to_owned());
+        lines.next();
+    }
+    let author = lines.next()?.strip_prefix("author ")?;
+    lines.next()?.strip_prefix("committer ")?;
+    let mut signed = false;
+    for line in lines {
+        // A header's continuation lines (a signature's body) start with a space.
+        if line.starts_with(' ') {
+            continue;
+        }
+        match line.split_once(' ')? {
+            ("tree" | "parent" | "author" | "committer", _) => return None,
+            ("gpgsig" | "gpgsig-sha256", _) => signed = true,
+            // The message's bytes are in some other encoding: not copied as if UTF-8.
+            ("encoding", value) if !value.eq_ignore_ascii_case("utf-8") => return None,
+            _ => {}
+        }
+    }
+    // `Name <email> seconds zone`; the name may be empty or hold spaces.
+    let (who, when) = author.rsplit_once("> ")?;
+    let (name, email) = who.rsplit_once('<')?;
+    let (secs, zone) = when.split_once(' ')?;
+    let zone_ok = zone.len() == 5 && zone.starts_with(['+', '-']) && zone[1..].bytes().all(|b| b.is_ascii_digit());
+    if secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) || !zone_ok || !is_object_id(tree) || !parents.iter().all(|p| is_object_id(p)) {
+        return None;
+    }
+    Some(RawCommit {
+        tree: tree.to_owned(),
+        parents,
+        author: author.to_owned(),
+        author_name: name.strip_suffix(' ').unwrap_or(name).to_owned(),
+        author_email: email.to_owned(),
+        author_date: format!("@{secs} {zone}"),
+        message: message.to_owned(),
+        signed,
+    })
+}
+
+/// Reads `--raw -z --no-renames`: `:old new oldsha newsha S`, NUL, path, NUL, repeated.
+fn parse_raw(raw: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut fields = raw.split('\0');
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let mut parts = meta.trim_start_matches(':').split(' ');
+        let (Some(_old), Some(mode)) = (parts.next(), parts.next()) else { continue };
+        // Mode 000000 after the change: the file is gone.
+        if mode.bytes().all(|b| b == b'0') {
+            continue;
+        }
+        out.push((path.to_owned(), mode.to_owned()));
+    }
+    out
 }
 
 /// Reads `log -z --format=%H%x00…%b`: seven NUL-ended fields a commit. No field can hold a
@@ -280,21 +498,48 @@ fn parse_version(out: &str) -> Option<(u32, u32)> {
 }
 
 fn run(dir: &Path, args: &[&str]) -> Result<Output, String> {
-    let mut child = Command::new("git")
-        .arg("-C")
+    let (code, out, stderr) = run_bytes(dir, args, &Call::default())?;
+    Ok(Output { code, stdout: String::from_utf8_lossy(&out).into_owned(), stderr })
+}
+
+/// What a git call needs beyond its arguments. Reading needs none of it.
+#[derive(Default)]
+struct Call<'a> {
+    /// Written to git's stdin, which is otherwise empty.
+    stdin: Option<&'a [u8]>,
+    env: &'a [(&'a str, &'a str)],
+    /// Variables git must not inherit.
+    unset: &'a [&'a str],
+    /// Set from another thread to stop waiting: git is killed and the call fails.
+    cancel: Option<&'a AtomicBool>,
+}
+
+/// What a cancelled call fails with.
+pub const CANCELLED: &str = "cancelled";
+
+fn run_bytes(dir: &Path, args: &[&str], call: &Call) -> Result<(Option<i32>, Vec<u8>, String), String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
-        // Read-only use: don't take locks to refresh the index, don't page, don't prompt, don't
-        // fetch an object a partial clone lacks (that runs transports and helpers), and show
-        // each object as itself, not as what refs/replace/ maps it to.
+        // Don't take locks to refresh the index, don't page, don't prompt, don't fetch an
+        // object a partial clone lacks (that runs transports and helpers), and show each
+        // object as itself, not as what refs/replace/ maps it to.
         .args(["--no-optional-locks", "--no-pager", "--no-replace-objects"])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .stdin(Stdio::null())
+        .envs(call.env.iter().copied())
+        .stdin(if call.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("couldn't run git: {e}"))?;
+        .stderr(Stdio::piped());
+    for var in call.unset {
+        cmd.env_remove(var);
+    }
+    // A test's git answers to the test's repository alone: never the user's config, and so
+    // never the user's signing key.
+    #[cfg(test)]
+    testing::isolate(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("couldn't run git: {e}"))?;
     let what = args.first().copied().unwrap_or("");
     // stderr drains on its own thread, so a chatty git can't block on a full pipe.
     let mut err_pipe = child.stderr.take().expect("stderr is piped");
@@ -307,7 +552,45 @@ fn run(dir: &Path, args: &[&str]) -> Result<Output, String> {
     });
     let mut out = Vec::new();
     let mut out_pipe = child.stdout.take().expect("stdout is piped");
-    let read = (&mut out_pipe).take(MAX_OUTPUT + 1).read_to_end(&mut out);
+    let in_pipe = child.stdin.take();
+    let overflow = AtomicBool::new(false);
+    // A plain read needs no more than this thread. A call that feeds git or can be cancelled
+    // gets a watcher, which stays until git is gone: it is what kills git on a cancel or on
+    // too much output, and git going is what lets a blocked writer finish.
+    let watched = in_pipe.is_some() || call.cancel.is_some();
+    let (read, cancelled) = std::thread::scope(|scope| {
+        if let (Some(mut pipe), Some(input)) = (in_pipe, call.stdin) {
+            scope.spawn(move || {
+                let _ = pipe.write_all(input);
+            });
+        }
+        let watcher = watched.then(|| {
+            scope.spawn(|| loop {
+                if let Ok(Some(_)) | Err(_) = child.try_wait() {
+                    return false;
+                }
+                let cancel = call.cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+                if cancel || overflow.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return cancel;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            })
+        });
+        let read = (&mut out_pipe).take(MAX_OUTPUT + 1).read_to_end(&mut out);
+        if read.is_err() || out.len() as u64 > MAX_OUTPUT {
+            overflow.store(true, Ordering::Relaxed);
+        }
+        // Closed here, so a git still writing fails instead of filling the pipe.
+        drop(out_pipe);
+        (read, watcher.is_some_and(|w| w.join().unwrap_or(false)))
+    });
+    if cancelled {
+        // stderr isn't waited for: something git started (a signing program waiting for a
+        // touch) may hold it open until it gives up on its own.
+        return Err(CANCELLED.to_owned());
+    }
     if read.is_err() || out.len() as u64 > MAX_OUTPUT {
         let _ = child.kill();
         let _ = child.wait();
@@ -317,14 +600,9 @@ fn run(dir: &Path, args: &[&str]) -> Result<Output, String> {
             Ok(_) => format!("git {what}: more than {} MB of output; too large to show", MAX_OUTPUT >> 20),
         });
     }
-    drop(out_pipe);
     let status = child.wait().map_err(|e| format!("git {what}: {e}"))?;
     let stderr = err_reader.join().unwrap_or_default();
-    Ok(Output {
-        code: status.code(),
-        stdout: String::from_utf8_lossy(&out).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-    })
+    Ok((status.code(), out, String::from_utf8_lossy(&stderr).into_owned()))
 }
 
 /// Helpers for tests that need a real repository.
@@ -348,23 +626,40 @@ pub mod testing {
             .arg(dir)
             .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"])
             .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
-        // Nothing inherited may point these commands (commits, `reset --hard`) at another
-        // repository: the list is `git rev-parse --local-env-vars`.
-        for var in [
-            "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
-            "GIT_GRAFT_FILE", "GIT_IMPLICIT_WORK_TREE", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS",
-            "GIT_INTERNAL_SUPER_PREFIX", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
-        ] {
-            cmd.env_remove(var);
-        }
+            ;
+        isolate(&mut cmd);
         let out = cmd.output().expect("git runs");
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
+    /// Makes a git answer to the test's repository alone: none of the user's config (and so
+    /// never the user's signing key), and nothing inherited that points it at another
+    /// repository or names who commits. The list is `git rev-parse --local-env-vars`.
+    pub fn isolate(cmd: &mut Command) {
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
+        for var in [
+            "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+            "GIT_GRAFT_FILE", "GIT_IMPLICIT_WORK_TREE", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS",
+            "GIT_INTERNAL_SUPER_PREFIX", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+        ] {
+            cmd.env_remove(var);
+        }
+    }
+
+    /// Gives the repository at `work` an identity and a key to sign with.
+    pub fn signing(dir: &Path, work: &Path) {
+        let key = dir.join("key");
+        let made = std::process::Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f"]).arg(&key).status().expect("ssh-keygen runs");
+        assert!(made.success());
+        for (k, v) in [("user.name", "Reader"), ("user.email", "reader@example.invalid"), ("gpg.format", "ssh"), ("user.signingkey", key.to_str().unwrap())] {
+            build(work, &["config", k, v]);
+        }
+        // For `git verify-commit`: the one key this repository's signatures may come from.
+        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        std::fs::write(dir.join("signers"), format!("reader@example.invalid {public}")).unwrap();
+    }
 }
 
 #[cfg(test)]

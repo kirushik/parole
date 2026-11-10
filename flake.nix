@@ -33,7 +33,8 @@
     {
       devShells.${system}.default = pkgs.mkShell {
         # git: the app shells out to it, and so do the tests and scripts.
-        nativeBuildInputs = [ rust pkgs.pkg-config pkgs.git ];
+        # openssh: git signs a take's commits with ssh-keygen, and the tests make a key with it.
+        nativeBuildInputs = [ rust pkgs.pkg-config pkgs.git pkgs.openssh ];
         buildInputs = libs;
         LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath libs;
       };
