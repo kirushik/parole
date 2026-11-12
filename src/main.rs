@@ -1,4 +1,4 @@
-//! refview: read what a sandbox wrote before bringing it in.
+//! parole: read what a sandbox wrote before bringing it in.
 //!
 //! Lists the refs under `refs/jail/` and `refs/devvm/` of a repository, the commits each has
 //! that HEAD lacks, and shows the selected commit (or the whole ref) as a diff, with the files
@@ -8,11 +8,11 @@
 //! all read can be taken: copied, signed, as a new local branch (`take.rs`); or dropped. The
 //! window itself is drawn in `ui.rs`.
 //!
-//! `refview [DIR] [--refs PATTERN]...` opens the window on the repository at DIR (default: the
+//! `parole [DIR] [--refs PATTERN]...` opens the window on the repository at DIR (default: the
 //! current directory). `--refs` replaces the default patterns and may repeat.
-//! `refview --snapshot DIR` shows what `jail diff DIR` prints for a folder that isn't a
+//! `parole --snapshot DIR` shows what `jail diff DIR` prints for a folder that isn't a
 //! repository, with the same marks and notes.
-//! Rune's headless flags work too: `refview DIR --snap out.png`, `--tree tree.json`,
+//! Rune's headless flags work too: `parole DIR --snap out.png`, `--tree tree.json`,
 //! `--script keys.json`, `--scene split`.
 
 mod agent;
@@ -41,7 +41,7 @@ use take::{Step, Taken, Way};
 const DEFAULT_PATTERNS: &[&str] = &["refs/jail", "refs/devvm"];
 /// How long a selection waits for its patch before the window draws without it. Short enough
 /// to go unnoticed, long enough that an ordinary commit never flashes "Reading".
-/// `REFVIEW_WAIT=1` waits until git answers, with the patch or an error, so a headless still
+/// `PAROLE_WAIT=1` waits until git answers, with the patch or an error, so a headless still
 /// is never taken mid-read.
 const QUICK: Duration = Duration::from_millis(20);
 struct Config {
@@ -88,7 +88,7 @@ fn config() -> &'static Config {
 }
 
 fn usage(problem: &str) -> ! {
-    eprintln!("refview: {problem}\nusage: refview [DIR] [--refs PATTERN]... [--no-agent]\n       refview --snapshot [DIR] [--no-agent]");
+    eprintln!("parole: {problem}\nusage: parole [DIR] [--refs PATTERN]... [--no-agent]\n       parole --snapshot [DIR] [--no-agent]");
     std::process::exit(2);
 }
 
@@ -109,7 +109,7 @@ struct State {
     repo: Option<Repo>,
     /// The ref patterns listed, `refs/jail` and `refs/devvm` unless `--refs` said otherwise.
     patterns: Vec<String>,
-    /// Wait for a patch however long it takes (`REFVIEW_WAIT`), so a still always has its diff.
+    /// Wait for a patch however long it takes (`PAROLE_WAIT`), so a still always has its diff.
     patient: bool,
     refs: Vec<RefInfo>,
     /// The rows that can be selected, in sidebar order.
@@ -194,7 +194,7 @@ struct State {
     take: Option<TakeView>,
     /// Wakes the window from another thread: `poll` then picks up what landed.
     waker: Option<Waker>,
-    /// jail's program (`jail`, or `REFVIEW_JAIL`).
+    /// jail's program (`jail`, or `PAROLE_JAIL`).
     jail_program: std::ffi::OsString,
 }
 
@@ -296,7 +296,7 @@ fn snapshot_patch(program: &std::ffi::OsStr, dir: &std::path::Path) -> Result<St
 impl State {
     fn open() -> State {
         let cfg = config();
-        let patient = std::env::var_os("REFVIEW_WAIT").is_some_and(|v| !v.is_empty());
+        let patient = std::env::var_os("PAROLE_WAIT").is_some_and(|v| !v.is_empty());
         if cfg.snapshot {
             return State::snapshot_with(&cfg.dir, patient, None, !cfg.no_agent);
         }
@@ -376,7 +376,7 @@ impl State {
             branches: HashMap::new(),
             take: None,
             waker: None,
-            jail_program: std::env::var_os("REFVIEW_JAIL").filter(|p| !p.is_empty()).unwrap_or_else(|| "jail".into()),
+            jail_program: std::env::var_os("PAROLE_JAIL").filter(|p| !p.is_empty()).unwrap_or_else(|| "jail".into()),
         }
     }
 
@@ -1287,7 +1287,7 @@ fn main() {
         poll: Some(poll),
         min_size: Some((760.0, 420.0)),
         families: ("Inter", "ui-monospace, Inter"),
-        ..AppSpec::new("refview", (1180.0, 760.0), State::open, view)
+        ..AppSpec::new("parole", (1180.0, 760.0), State::open, view)
     };
     App::new(spec).modifier_keys().run();
 }
@@ -1333,11 +1333,11 @@ mod tests {
     fn app(name: &str) -> (Runtime<State>, std::path::PathBuf) {
         let dir = scratch(name);
         repo(&dir.join("repo"));
-        let reviewed = Reviewed::at(Some(dir.join("state/refview/reviewed")));
+        let reviewed = Reviewed::at(Some(dir.join("state/parole/reviewed")));
         let patterns = DEFAULT_PATTERNS.iter().map(|&p| p.to_owned()).collect();
-        let mut state = State::empty(patterns, reviewed, Taken::at(Some(dir.join("state/refview/taken"))), true);
+        let mut state = State::empty(patterns, reviewed, Taken::at(Some(dir.join("state/parole/taken"))), true);
         // No test asks the real model or keeps answers in the user's own state directory.
-        state.agent = agent::Agent { program: "false".into(), cache: Some(dir.join("state/refview/agent")) };
+        state.agent = agent::Agent { program: "false".into(), cache: Some(dir.join("state/parole/agent")) };
         state.start(&dir.join("repo"));
         let mut rt = Runtime::new(state, view, (1180.0, 760.0), Env { system_dark: true, scale: 1.0 });
         rt.on_key = Some(on_key);
@@ -1459,7 +1459,7 @@ mod tests {
     }
 
     fn saved(dir: &std::path::Path) -> Vec<String> {
-        std::fs::read_to_string(dir.join("state/refview/reviewed")).unwrap_or_default().lines().map(str::to_owned).collect()
+        std::fs::read_to_string(dir.join("state/parole/reviewed")).unwrap_or_default().lines().map(str::to_owned).collect()
     }
 
     #[test]
@@ -1624,8 +1624,8 @@ mod tests {
     fn a_failed_save_leaves_the_diff_up_and_says_so() {
         let (mut rt, dir) = app("save");
         // A directory where the list should be: saving what the next diff's reading marks fails.
-        std::fs::remove_file(dir.join("state/refview/reviewed")).unwrap();
-        std::fs::create_dir_all(dir.join("state/refview/reviewed")).unwrap();
+        std::fs::remove_file(dir.join("state/parole/reviewed")).unwrap();
+        std::fs::create_dir_all(dir.join("state/parole/reviewed")).unwrap();
         type_key(&mut rt, "N");
         rt.frame(1.0 / 60.0);
         rt.frame(1.0 / 60.0);
@@ -1651,12 +1651,12 @@ mod tests {
     fn script(dir: &std::path::Path, name: &str, body: &str) -> std::ffi::OsString {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n[ -n \"$REFVIEW_PROBE\" ] && exit 0\n{body}")).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n[ -n \"$PAROLE_PROBE\" ] && exit 0\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Another test's thread may have forked while this file was open for writing; until
         // that child execs, running the script fails with "text file busy". Wait it out.
         for _ in 0..200 {
-            match std::process::Command::new(&path).env("REFVIEW_PROBE", "1").status() {
+            match std::process::Command::new(&path).env("PAROLE_PROBE", "1").status() {
                 Ok(_) => return path.into_os_string(),
                 Err(_) => std::thread::sleep(Duration::from_millis(5)),
             }
@@ -1822,7 +1822,7 @@ mod tests {
         until(&mut rt, "the agent's answer", answered);
         let report = rt.state.report().unwrap().report.clone().unwrap();
         assert!(!report.complete && report.findings.is_empty());
-        assert!(!dir.join("state/refview/agent").exists(), "a reply that didn't end properly isn't kept");
+        assert!(!dir.join("state/parole/agent").exists(), "a reply that didn't end properly isn't kept");
         type_key(&mut rt, "n");
         // What stopped it comes last, on either stream; the warning before it isn't the news.
         rt.state.agent.program = script(&dir, "agent2.sh", "cat > /dev/null\necho 'a long warning about config files' >&2\necho 'not logged in'\nexit 3\n");

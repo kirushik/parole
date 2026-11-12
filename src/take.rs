@@ -16,7 +16,7 @@
 //! branch, and no later `git bisect` can land on one. You get what you read.
 //!
 //! Each signature may need a touch of a hardware key. Copies already made are remembered
-//! (`$XDG_STATE_HOME/refview/taken`, `OLD NEW` a line), so a take that stops halfway picks up
+//! (`$XDG_STATE_HOME/parole/taken`, `OLD NEW` a line), so a take that stops halfway picks up
 //! where it stopped instead of asking for every touch again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -70,7 +70,7 @@ fn is_one_key(s: &str) -> bool {
 
 /// The line a one-commit take's message ends with: which ref it was, and at which commit.
 fn one_source(r: &RefInfo) -> String {
-    format!("Read as one change with refview, from {} at {}.\n", r.name, r.tip)
+    format!("Read as one change with parole, from {} at {}.\n", r.name, r.tip)
 }
 
 /// The copies made so far, by the hash of the commit each one copies, or by the

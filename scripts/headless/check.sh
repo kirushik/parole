@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Draws refview without a window against the fixture repository: stills and element trees
+# Draws parole without a window against the fixture repository: stills and element trees
 # in out/, for looking at. Behaviour is asserted by `cargo test`; this checks what only a real
 # run shows: that the binary starts, the scripts replay, the reviewed list is written where it
 # should be, and a slow git goes through "Reading" to its diff.
@@ -9,22 +9,22 @@ set -euo pipefail
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 # The reviewed list goes to a scratch state directory, not the real one.
-# REFVIEW_WAIT: a still is taken only once git has answered.
+# PAROLE_WAIT: a still is taken only once git has answered.
 # Git reads no config but the fixture's own, so a take signs with the fixture's key.
-export XDG_STATE_HOME="$tmp/state" RUNE_PERF_WARN=0 REFVIEW_WAIT=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-bin=${REFVIEW_BIN:-target/debug/refview}
+export XDG_STATE_HOME="$tmp/state" RUNE_PERF_WARN=0 PAROLE_WAIT=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+bin=${PAROLE_BIN:-target/debug/parole}
 # No run here reaches the real model: a stand-in answers, with nothing to say unless a check
 # gives it something.
 agent="$tmp/agent.sh"
 quiet() { printf '#!/bin/sh\ncat > /dev/null\necho END\n' > "$agent"; chmod +x "$agent"; }
 quiet
-export REFVIEW_AGENT="$agent"
+export PAROLE_AGENT="$agent"
 fixture="$tmp/fixture"
 scripts/fixture.sh "$fixture" > /dev/null
 rm -rf out
 mkdir -p out
 here=scripts/headless
-reviewed="$tmp/state/refview/reviewed"
+reviewed="$tmp/state/parole/reviewed"
 
 fail() { echo "check.sh: $*" >&2; exit 1; }
 
@@ -33,7 +33,7 @@ fail() { echo "check.sh: $*" >&2; exit 1; }
 run() {
     [ -n "${KEEP_STATE:-}" ] || rm -rf -- "$tmp/state"
     local log="$tmp/log"
-    "$bin" "$@" > "$log" 2>&1 || { cat "$log" >&2; fail "refview $* failed"; }
+    "$bin" "$@" > "$log" 2>&1 || { cat "$log" >&2; fail "parole $* failed"; }
     grep -v '^rune' "$log" || true
 }
 
@@ -139,7 +139,7 @@ has out/not-a-repo.json 'not a git repository'
 
 # A bad argument is refused before any window.
 if "$bin" "$fixture" --refs 2> "$tmp/err"; then fail "--refs with no pattern was accepted"; fi
-grep -q 'usage: refview' "$tmp/err" || fail "no usage line for a bad argument"
+grep -q 'usage: parole' "$tmp/err" || fail "no usage line for a bad argument"
 
 # The slow path: a git that takes 0.3 s outlasts the wait, so the window says "Reading" and
 # the diff lands later through `poll`. Real time, since the worker runs on the wall clock.
@@ -150,7 +150,7 @@ export REAL_GIT
 printf '#!/bin/sh\nsleep 0.3\nexec "$REAL_GIT" "$@"\n' > "$slow/git"
 chmod +x "$slow/git"
 for at in early end; do
-    REFVIEW_WAIT= PATH="$slow:$PATH" run "$fixture" --realtime --script $here/slow.json --at mark:$at --tree out/slow-$at.json
+    PAROLE_WAIT= PATH="$slow:$PATH" run "$fixture" --realtime --script $here/slow.json --at mark:$at --tree out/slow-$at.json
 done
 has out/slow-early.json 'Reading'
 lacks out/slow-early.json 'src/backoff.rs'

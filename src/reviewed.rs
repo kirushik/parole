@@ -1,5 +1,5 @@
 //! The commits already read, by full hash, one per line in
-//! `$XDG_STATE_HOME/refview/reviewed` (default `~/.local/state/refview/reviewed`), so reviewing
+//! `$XDG_STATE_HOME/parole/reviewed` (default `~/.local/state/parole/reviewed`), so reviewing
 //! writes nothing into the repository being reviewed. A hash names a commit's content and
 //! history: a ref rewritten to different commits shows them unread, and a commit that comes
 //! back with the same hash is the same commit and stays read.
@@ -24,7 +24,7 @@ pub struct Reviewed {
     unsaved: Vec<(String, bool)>,
 }
 
-/// Where refview keeps `name` between runs, when there is an absolute state directory.
+/// Where parole keeps `name` between runs, when there is an absolute state directory.
 pub fn state_file(name: &str) -> Option<PathBuf> {
     Some(default_path()?.with_file_name(name))
 }
@@ -35,7 +35,7 @@ fn default_path() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
         // A relative HOME would put the list under wherever this was started: a repository, say.
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute()).map(|h| h.join(".local/state")))?;
-    Some(state.join("refview/reviewed"))
+    Some(state.join("parole/reviewed"))
 }
 
 /// The list on disk. A file that isn't there is an empty list; one that can't be read is an
@@ -116,7 +116,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("refview-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("parole-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn each_change_is_on_disk_before_the_next() {
         let dir = scratch("each");
-        let path = dir.join("refview/reviewed");
+        let path = dir.join("parole/reviewed");
         let mut r = Reviewed::at(Some(path.clone()));
         r.set(&["aaa", "bbb"], true).unwrap();
         let after_mark = Reviewed::at(Some(path.clone()));
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn a_second_window_keeps_the_firsts_marks() {
         let dir = scratch("two");
-        let path = dir.join("refview/reviewed");
+        let path = dir.join("parole/reviewed");
         let mut one = Reviewed::at(Some(path.clone()));
         let mut two = Reviewed::at(Some(path.clone()));
         one.set(&["aaa"], true).unwrap();
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn a_save_that_works_carries_the_ones_that_failed() {
         let dir = scratch("retry");
-        let path = dir.join("refview/reviewed");
+        let path = dir.join("parole/reviewed");
         std::fs::create_dir_all(&path).unwrap();
         let mut r = Reviewed::at(Some(path.clone()));
         assert!(r.set(&["aaa"], true).is_err());
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn a_symlink_at_the_temporary_name_is_not_written_through() {
         let dir = scratch("symlink");
-        let path = dir.join("refview/reviewed");
+        let path = dir.join("parole/reviewed");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let victim = dir.join("victim");
         std::fs::write(&victim, "keep me\n").unwrap();
@@ -187,7 +187,7 @@ mod tests {
     fn an_unreadable_list_is_not_replaced() {
         let dir = scratch("unreadable");
         // A directory where the file should be: reading it fails, and not with "not found".
-        let path = dir.join("refview/reviewed");
+        let path = dir.join("parole/reviewed");
         std::fs::create_dir_all(&path).unwrap();
         let mut r = Reviewed::at(Some(path.clone()));
         assert!(r.set(&["aaa"], true).is_err());

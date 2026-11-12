@@ -13,10 +13,10 @@
 //!   and a line the patch shows. The text of a finding is drawn as text, nothing more.
 //!
 //! It is the `claude` CLI in print mode, run in an empty private folder with the user's own
-//! settings only. `REFVIEW_AGENT` names another program to run in its place, which gets the
+//! settings only. `PAROLE_AGENT` names another program to run in its place, which gets the
 //! same arguments and the numbered patch on stdin.
 //!
-//! A reply that ended properly is kept (`$XDG_STATE_HOME/refview/agent/`), named by a hash of
+//! A reply that ended properly is kept (`$XDG_STATE_HOME/parole/agent/`), named by a hash of
 //! everything it answers: the model, the instructions and the patch. The same diff is then
 //! never sent twice unless a fresh look is asked for.
 
@@ -172,9 +172,9 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// `claude` (or `REFVIEW_AGENT`), keeping replies under the state directory.
+    /// `claude` (or `PAROLE_AGENT`), keeping replies under the state directory.
     pub fn from_env() -> Agent {
-        let program = std::env::var_os("REFVIEW_AGENT").filter(|p| !p.is_empty()).unwrap_or_else(|| "claude".into());
+        let program = std::env::var_os("PAROLE_AGENT").filter(|p| !p.is_empty()).unwrap_or_else(|| "claude".into());
         Agent { program, cache: crate::reviewed::state_file("agent") }
     }
 
@@ -212,14 +212,14 @@ impl Agent {
         // error, not a place to run.
         static ASKED: AtomicUsize = AtomicUsize::new(0);
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-        let dir = std::env::temp_dir().join(format!("refview-agent-{}-{}-{nanos}", std::process::id(), ASKED.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!("parole-agent-{}-{}-{nanos}", std::process::id(), ASKED.fetch_add(1, Ordering::Relaxed)));
         std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let mut cmd = Command::new(&self.program);
         cmd.current_dir(&dir)
             .args(["--print", "--model", MODEL, "--tools", "", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"])
             // The user's own settings, and none a folder could supply.
             .args(["--setting-sources", "user", "--output-format", "text", "--system-prompt", PROMPT])
-            // Not a session of whatever started refview.
+            // Not a session of whatever started parole.
             .env_remove("CLAUDECODE");
         let out = crate::proc::run(cmd, Some(input.to_owned()), 4 << 20, TIMEOUT);
         let _ = std::fs::remove_dir(&dir);

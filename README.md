@@ -1,12 +1,22 @@
-# refview
+# parole
 
-Decides what a sandbox wrote may become a local branch of yours. A native window, and a
-trial of [Rune](https://github.com/anomalyco/rune), pinned to one rev of its `dev` branch.
+A parole board for the code your agents write in a sandbox: you read what it did, and it
+gets out as a branch under your signature, or it doesn't.
+
+If you let a coding agent work in a container or a VM, its commits come back unsigned, by
+an author that isn't you, and unread. Checking the branch out to look at it is already
+running it: your editor's language server builds it, `direnv` loads its `.envrc`, a hook
+fires. parole is a native window that shows such work without checking anything out, keeps
+track of what you have actually had in front of you, and only then makes a signed branch.
+
+It is also a trial of [Rune](https://github.com/anomalyco/rune), a GPU UI toolkit for Rust
+that is not released yet: parole builds against one pinned revision of it.
 
 ![A commit from refs/jail that reaches for the host: the model's notes on their lines, and one alarm](docs/screenshot.png)
 
-A jail or a dev VM leaves its work as refs (`refs/jail/*`, `refs/devvm/*`): unsigned commits
-by an agent, which nobody has read. refview takes a ref through three steps:
+It expects the sandbox's work as git refs outside `refs/heads` (by default `refs/jail/*` and
+`refs/devvm/*`; `--refs` names others), fetched into your repository but never checked
+out. It takes each ref through three steps:
 
 1. **Read it.** The commits HEAD lacks, oldest first, each as a diff, or the ref's whole
    change as one. The files your machine would run without being asked come first and say
@@ -14,7 +24,7 @@ by an agent, which nobody has read. refview takes a ref through three steps:
    what it takes for deliberate harm is an alarm, in red.
 2. **Decide.** No key marks anything read. The window knows which changed lines have been on
    screen; a commit is read once all of its have. A ref can be read two ways: commit by
-   commit, or as one change (press the ref's name). **Take** fills as you go. **Drop**
+   commit, or as one change (press the ref's name, or `N`). **Take** fills as you go. **Drop**
    deletes the ref instead.
 3. **Take it.** `t` makes a new local branch `reviewed/…`, signed by you, of what you read.
    Read commit by commit, it is a copy of each commit: one touch of your key a commit. Read
@@ -54,7 +64,7 @@ on a git that hangs).
 
 Some files run, or decide what runs, without you choosing to run them: `build.rs` at the next
 build, `.envrc` when you enter the folder, a workflow on the forge, `CLAUDE.md` when an agent
-opens the project. refview marks them by path and file mode ([src/risk.rs](src/risk.rs) is
+opens the project. parole marks them by path and file mode ([src/risk.rs](src/risk.rs) is
 the whole list): they come first in the diff, each with the reason after its path, and the
 commit's row in the sidebar carries a terminal mark.
 
@@ -75,7 +85,7 @@ line, and any note in two columns. Its ref and
 file are marked, and Drop becomes the filled button. The model is fallible either way: an
 alarm is a reason to look, and no alarm is not a clearance.
 
-A reply is kept (`$XDG_STATE_HOME/refview/agent/`), named by a hash of the model, the
+A reply is kept (`$XDG_STATE_HOME/parole/agent/`), named by a hash of the model, the
 instructions and the diff, so the same diff is sent once. `a` asks the model again; what an
 earlier look found stays, and a new look only adds to it. With a ref's whole change on
 screen, the model is also asked about each of its commits (up to 40), one after another:
@@ -94,7 +104,7 @@ The diff was written by the thing being judged, and may try to talk the model ro
 - It runs in an empty private folder, with your own Claude settings and none a folder could
   supply.
 
-`REFVIEW_AGENT` names another program to run in its place.
+`PAROLE_AGENT` names another program to run in its place.
 
 ## Taking a ref
 
@@ -139,7 +149,7 @@ Nothing is checked out or merged, HEAD and the working tree stay as they are, an
 hook runs. While signatures are being made no key but Esc does anything, no other row can
 be selected, and nothing else can be taken, dropped, undone or switched to. Esc pauses; a
 take that is paused or fails makes no branch. The copies already signed are
-remembered (`$XDG_STATE_HOME/refview/taken`), so going on asks only for the signatures
+remembered (`$XDG_STATE_HOME/parole/taken`), so going on asks only for the signatures
 still missing. A remembered copy is used only if it is a signed commit with the original's
 tree, parents, message and author; whose signature it carries isn't checked, so that file is
 trusted as far as that.
@@ -163,8 +173,8 @@ clone or VM run the ref came from is not touched.
 
 ## State
 
-The commits you have read live in `$XDG_STATE_HOME/refview/reviewed`
-(`~/.local/state/refview/reviewed`), one a line: a commit's full hash, or for a ref's whole
+The commits you have read live in `$XDG_STATE_HOME/parole/reviewed`
+(`~/.local/state/parole/reviewed`), one a line: a commit's full hash, or for a ref's whole
 change `whole:` with the two hashes it lies between. So reading writes nothing into the
 repository. A ref rewritten to different commits shows them unread. If neither
 `XDG_STATE_HOME` nor `HOME` is an absolute path, marks last only for the run.
@@ -176,13 +186,18 @@ nix develop             # or put `use flake` in an .envrc and `direnv allow`
 cargo run --release -- ~/path/to/repo
 ```
 
-Needs git 2.46 or later. `refview [DIR] [--refs PATTERN]...`: DIR defaults to the current
+Linux, on Wayland or X11, with Vulkan. Without Nix you need the Rust toolchain Rune pins
+(1.99.1), git and ssh-keygen, and the libraries [flake.nix](flake.nix) lists (libxkbcommon,
+wayland, vulkan-loader, fontconfig and the X11 ones). The first build fetches and compiles
+Rune from GitHub. Other platforms are untried.
+
+Needs git 2.46 or later. `parole [DIR] [--refs PATTERN]...`: DIR defaults to the current
 directory; `--refs` replaces the default patterns (`refs/jail`, `refs/devvm`), must start
 with `refs/`, and may repeat.
 
 `--no-agent` sends no diff to the model unless you press `a`.
 
-`refview --snapshot [DIR]` is for a folder that isn't a repository (`jail --dir`): it shows
+`parole --snapshot [DIR]` is for a folder that isn't a repository (`jail --dir`): it shows
 what `jail diff DIR` prints, committed or not, with the same marks and the same second
 reader. There are no commits there to take or drop; `jail apply` is how that work comes in.
 
@@ -220,19 +235,19 @@ A held key repeats for moving about, never for `t`, `x`, `z` or Enter.
 ## Try it without a sandbox
 
 ```sh
-scripts/fixture.sh /tmp/refview-fixture
-cargo run -- /tmp/refview-fixture
+scripts/fixture.sh /tmp/parole-fixture
+cargo run -- /tmp/parole-fixture
 ```
 
 The fixture has a ref that reaches for the host (`jail/speed-up-ci`) and its own throwaway
 signing key, so a take there never asks for yours. To try a take with your own key (and its
-touch), build it with `scripts/fixture.sh /tmp/refview-fixture --own-key`.
+touch), build it with `scripts/fixture.sh /tmp/parole-fixture --own-key`.
 
 Its commit hashes are the same every time it is built, so what you read and took there last
 time is still read and taken. For a clean start, keep this run's state apart:
 
 ```sh
-XDG_STATE_HOME=$(mktemp -d) cargo run -- /tmp/refview-fixture
+XDG_STATE_HOME=$(mktemp -d) cargo run -- /tmp/parole-fixture
 ```
 
 ## Checking it without a window
@@ -249,8 +264,9 @@ runs the real binary headless against the fixture, replaying the scripts in
 
 ## Not done
 
-- Nothing here has signed with a hardware key or asked the real model: the tests sign with a
-  software key and a stand-in answers for the agent.
+- A take with a hardware key and the real model have each been tried by hand, on the fixture
+  below. The tests sign with a software key, and a stand-in answers for the agent.
+- One dark theme, and no syntax colours.
 - A take copies each commit's tree, parents, message, author and author date. Other headers
   (an old signature, a `mergetag`) are dropped.
 - Stopping a take kills git, not the signing program it started, which gives up when its own

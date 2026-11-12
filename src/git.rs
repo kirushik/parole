@@ -1,4 +1,4 @@
-//! Everything refview asks of git. Reviewing only reads: `version`, `rev-parse`, `hash-object`
+//! Everything parole asks of git. Reviewing only reads: `version`, `rev-parse`, `hash-object`
 //! (without `-w`), `for-each-ref`, `merge-base`, `log`, `show`, `diff`, `rev-list`, `cat-file`,
 //! `check-ref-format` and `symbolic-ref` (to read). Nothing is checked out, merged or built.
 //!
@@ -129,7 +129,7 @@ impl Repo {
         let version = run(dir, &["version"])?.ok("version")?;
         match parse_version(&version) {
             Some(v) if v >= MIN_GIT => {}
-            _ => return Err(format!("refview needs git {}.{} or later; this is {}", MIN_GIT.0, MIN_GIT.1, version.trim())),
+            _ => return Err(format!("parole needs git {}.{} or later; this is {}", MIN_GIT.0, MIN_GIT.1, version.trim())),
         }
         let top = run(dir, &["rev-parse", "--show-toplevel"])?.ok("rev-parse")?;
         let top = Path::new(top.strip_suffix('\n').unwrap_or(&top));
@@ -416,7 +416,7 @@ impl Repo {
             return Err(format!("{name} is a symbolic ref; it is left alone"));
         }
         let absent = "0".repeat(tip.len());
-        let reason = format!("refview: take {from}");
+        let reason = format!("parole: take {from}");
         self.git(&["update-ref", "--no-deref", "-m", &reason, "--end-of-options", &name, tip, &absent])?.ok("update-ref").map(drop)
     }
 
@@ -425,7 +425,7 @@ impl Repo {
     pub fn delete_ref(&self, name: &str, tip: &str) -> Result<(), String> {
         let tip = object_id(tip)?;
         self.plain_ref(name)?;
-        self.git(&["update-ref", "--no-deref", "-d", "-m", "refview: drop", "--end-of-options", name, tip])?.ok("update-ref").map(drop)
+        self.git(&["update-ref", "--no-deref", "-d", "-m", "parole: drop", "--end-of-options", name, tip])?.ok("update-ref").map(drop)
     }
 
     /// Puts the ref `name` back at `tip`, unless something is there by now.
@@ -433,7 +433,7 @@ impl Repo {
         let tip = object_id(tip)?;
         self.plain_ref(name)?;
         let absent = "0".repeat(tip.len());
-        self.git(&["update-ref", "--no-deref", "-m", "refview: undo drop", "--end-of-options", name, tip, &absent])?.ok("update-ref").map(drop)
+        self.git(&["update-ref", "--no-deref", "-m", "parole: undo drop", "--end-of-options", name, tip, &absent])?.ok("update-ref").map(drop)
     }
 
     /// A full ref name this may delete or put back: one git accepts, that reached us whole,
@@ -709,7 +709,7 @@ pub mod testing {
 
     /// An empty scratch directory for one test.
     pub fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("refview-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("parole-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn a_hostile_ref_and_config_run_nothing_and_write_nothing() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("refview-hostile-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("parole-hostile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let repo_dir = dir.join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn the_hostile_config_is_live_without_the_flags() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("refview-control-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("parole-control-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let repo_dir = dir.join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();

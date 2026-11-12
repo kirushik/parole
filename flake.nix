@@ -1,5 +1,5 @@
 {
-  description = "refview: a read-only reviewer for sandbox-written git refs, built on Rune";
+  description = "parole: a read-only reviewer for sandbox-written git refs, built on Rune";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

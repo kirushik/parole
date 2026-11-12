@@ -68,13 +68,13 @@ macro_rules! glyph {
         static $name: Icon = Icon { name: $id, view: 16.0, body: $body };
     };
 }
-glyph!(BOT, "refview-bot", r#"<rect x="2.5" y="5" width="11" height="8.5" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M8 5V2.5M6 8.5v1.5M10 8.5v1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/>"#);
-glyph!(TERM, "refview-term", r#"<rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4.5 6.5l2 1.5-2 1.5M8.5 10h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
-glyph!(KEY, "refview-key", r#"<rect x="4.5" y="1.5" width="7" height="13" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><circle cx="8" cy="6" r="1.8" stroke="currentColor" stroke-width="1.5" fill="none"/>"#);
-glyph!(ARROW, "refview-arrow", r#"<path d="M2.5 8h11M9.5 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
-glyph!(UNIFIED, "refview-unified", r#"<rect x="2.5" y="2.5" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M5 6h6M5 8.5h6M5 11h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/>"#);
-glyph!(SPLIT, "refview-split", r#"<rect x="2.5" y="2.5" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M8 2.5v11" stroke="currentColor" stroke-width="1.5" fill="none"/>"#);
-glyph!(WARN, "refview-warn", r#"<path d="M8 2l6.5 11.5h-13zM8 6.5v3.5M8 12v.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
+glyph!(BOT, "parole-bot", r#"<rect x="2.5" y="5" width="11" height="8.5" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M8 5V2.5M6 8.5v1.5M10 8.5v1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/>"#);
+glyph!(TERM, "parole-term", r#"<rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4.5 6.5l2 1.5-2 1.5M8.5 10h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
+glyph!(KEY, "parole-key", r#"<rect x="4.5" y="1.5" width="7" height="13" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><circle cx="8" cy="6" r="1.8" stroke="currentColor" stroke-width="1.5" fill="none"/>"#);
+glyph!(ARROW, "parole-arrow", r#"<path d="M2.5 8h11M9.5 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
+glyph!(UNIFIED, "parole-unified", r#"<rect x="2.5" y="2.5" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M5 6h6M5 8.5h6M5 11h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/>"#);
+glyph!(SPLIT, "parole-split", r#"<rect x="2.5" y="2.5" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M8 2.5v11" stroke="currentColor" stroke-width="1.5" fill="none"/>"#);
+glyph!(WARN, "parole-warn", r#"<path d="M8 2l6.5 11.5h-13zM8 6.5v3.5M8 12v.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 
 /// The faces the window uses, sized once.
 struct Ty {
@@ -219,7 +219,7 @@ fn sidebar(s: &State, t: &Ty) -> El {
     let title = match (&s.repo, &s.snapshot) {
         (_, Some(_)) => "a folder's jail snapshot".to_owned(),
         (Some(repo), _) => repo.name(),
-        _ => "refview".to_owned(),
+        _ => "parole".to_owned(),
     };
     let mut list = col().w_full().px(8.0).pb(8.0);
     let mut i = 0;

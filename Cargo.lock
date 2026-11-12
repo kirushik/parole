@@ -2179,6 +2179,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "parole"
+version = "0.1.0"
+dependencies = [
+ "rune",
+ "rune-kit",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2497,14 +2505,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
 dependencies = [
  "bitflags 2.13.2",
-]
-
-[[package]]
-name = "refview"
-version = "0.1.0"
-dependencies = [
- "rune",
- "rune-kit",
 ]
 
 [[package]]

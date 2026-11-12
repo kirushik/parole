@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds a small repository with sandbox-style refs to try refview on:
-#   scripts/fixture.sh /tmp/refview-fixture && cargo run -- /tmp/refview-fixture
+# Builds a small repository with sandbox-style refs to try parole on:
+#   scripts/fixture.sh /tmp/parole-fixture && cargo run -- /tmp/parole-fixture
 # With --own-key the repository gets no signing key of its own, so a take there signs with
 # yours (and asks for a touch, if yours is a hardware key).
 # Dates and authors are fixed, so the commit hashes (and headless snapshots) repeat.
@@ -143,10 +143,10 @@ git branch -q -D work vm cache
 # Taking a ref signs its copies. Give this repository a throwaway software key for that, so
 # a take here never asks for yours, unless that is what was asked for.
 if [ "$own_key" != --own-key ]; then
-    ssh-keygen -q -t ed25519 -N "" -C refview-fixture -f .git/refview-fixture-key
+    ssh-keygen -q -t ed25519 -N "" -C parole-fixture -f .git/parole-fixture-key
     git config user.name Reader
     git config user.email reader@example.invalid
     git config gpg.format ssh
-    git config user.signingkey "$PWD/.git/refview-fixture-key"
+    git config user.signingkey "$PWD/.git/parole-fixture-key"
 fi
 echo "$dir"
