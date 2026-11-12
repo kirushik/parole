@@ -286,3 +286,9 @@ runs the real binary headless against the fixture, replaying the scripts in
 - Two windows marking in the same instant can lose one mark: there is no lock.
 - The reviewed and taken lists are never pruned on their own.
 - No file tree beside the diff, no search, no comments.
+
+## Licence
+
+MIT; see [LICENSE](LICENSE). The diff view in [src/diff/](src/diff/) is derived from rune-kit,
+part of [Rune](https://github.com/anomalyco/rune) (MIT, © 2026 Anomaly), which is why the
+licence carries both names.
