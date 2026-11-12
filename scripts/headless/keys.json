@@ -1,7 +1,6 @@
 [
-  {"t": 0.2, "type": "type", "text": "n"},
+  {"t": 0.2, "type": "type", "text": "N"},
   {"t": 0.4, "type": "type", "text": "n"},
-  {"t": 0.6, "type": "type", "text": "r"},
   {"t": 0.8, "type": "type", "text": "s"},
   {"t": 2.0, "type": "mark", "name": "end"}
 ]

@@ -3,9 +3,10 @@
 //! Lists the refs under `refs/jail/` and `refs/devvm/` of a repository, the commits each has
 //! that HEAD lacks, and shows the selected commit (or the whole ref) as a diff, with the files
 //! the host would run marked (`risk.rs`) and a model's notes on what looks dangerous
-//! (`agent.rs`). Reviewing only reads: see `git.rs` for the exact commands. A ref
-//! whose commits are all marked read can be taken: copied, signed, as a new local branch
-//! (`take.rs`).
+//! (`agent.rs`). Reading only reads: see `git.rs` for the exact commands. Nothing marks a
+//! commit read but its changed lines having been on screen (`diff/`). A ref whose commits are
+//! all read can be taken: copied, signed, as a new local branch (`take.rs`); or dropped. The
+//! window itself is drawn in `ui.rs`.
 //!
 //! `refview [DIR] [--refs PATTERN]...` opens the window on the repository at DIR (default: the
 //! current directory). `--refs` replaces the default patterns and may repeat.
@@ -15,13 +16,15 @@
 //! `--script keys.json`, `--scene split`.
 
 mod agent;
+mod diff;
 mod git;
 mod proc;
 mod reviewed;
 mod risk;
 mod take;
+mod ui;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -30,10 +33,10 @@ use std::time::{Duration, Instant};
 
 use git::{Commit, RefInfo, Repo};
 use reviewed::Reviewed;
-use rune::{App, AppSpec, Cx, El, Key, KeyEvent, Latest, ScrollSpec, Tx, Waker, col, el, row, text};
-use rune_kit::diff::{Annotation, DiffMode, DiffState, DiffView, FileDiff, FileStatus, LineRef, Side, parse};
-use take::{Step, Taken};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit, SegmentedControl};
+use rune::{App, AppSpec, Cx, El, Key, KeyEvent, Latest, Tx, Waker};
+use diff::{Annotation, DiffMode, DiffState, LineRef};
+use rune_kit::diff::{FileDiff, FileStatus, Side, parse};
+use take::{Step, Taken, Way};
 
 const DEFAULT_PATTERNS: &[&str] = &["refs/jail", "refs/devvm"];
 /// How long a selection waits for its patch before the window draws without it. Short enough
@@ -41,8 +44,6 @@ const DEFAULT_PATTERNS: &[&str] = &["refs/jail", "refs/devvm"];
 /// `REFVIEW_WAIT=1` waits until git answers, with the patch or an error, so a headless still
 /// is never taken mid-read.
 const QUICK: Duration = Duration::from_millis(20);
-const KEYS: &str = "n / p  commit     j / k  hunk     ] / [  file     s  split     w  wrap     r  reviewed     a  ask again     t  take     u  reload";
-
 struct Config {
     dir: PathBuf,
     patterns: Vec<String>,
@@ -142,8 +143,42 @@ struct State {
     /// What the agent said about each diff shown this run, by the diff's own text: a diff
     /// that changes is another diff.
     reports: HashMap<Arc<str>, Asked>,
-    /// How many notes the agent left on each commit, by hash, for the sidebar.
-    noted: HashMap<String, usize>,
+    /// How many notes and how many alarms the agent left on each diff it has read: by hash
+    /// for a commit, by [`whole_key`] for a ref's whole change.
+    levels: HashMap<String, (usize, usize)>,
+    /// The changed lines that have been on screen, kept while another diff is up: by what
+    /// the diff was of ([`State::key`]), its own text, and the order its files were shown in.
+    /// Lines are named by their file's place in the diff, so only the same order will do.
+    seen_by: HashMap<Shown, Seen>,
+    /// What the diff on screen is filed under, from when it landed.
+    shown_key: Option<String>,
+    /// Where the take left each taken ref's branch, by the ref's name: the signed copy of
+    /// its tip. Undo and Switch act on the branch only while it is still there.
+    took: HashMap<String, String>,
+    /// The taken refs that were taken as one commit, by name: their commits have no copies.
+    took_one: HashSet<String>,
+    /// Commits the model has been asked about without their diff being opened.
+    preread: HashSet<String>,
+    /// Those still to ask about, and whether the thread that asks is running.
+    ahead: Arc<Mutex<(std::collections::VecDeque<String>, bool)>>,
+    /// The "no changes" page of an empty diff has been built for a frame.
+    pub(crate) empty_drawn: std::cell::Cell<bool>,
+    /// Commits opened this run and not yet read to the end.
+    partial: HashSet<String>,
+    /// The branch the checkout is on.
+    head: Option<String>,
+    /// Refs dropped this run, as they were: struck out in the sidebar until put back.
+    dropped: Vec<RefInfo>,
+    /// What `z` would undo, newest last.
+    undo: Vec<Did>,
+    /// The keys card is up.
+    keys_open: bool,
+    /// The note opened to its full length, by its annotation's id.
+    open_note: Option<String>,
+    /// Which note `m` goes to next.
+    note_at: usize,
+    /// The file at the top of the diff, for the outline.
+    visible_file: usize,
     /// Answers come back here from the threads that asked.
     answers: (Sender<Answer>, Receiver<Answer>),
     /// How many questions are out.
@@ -179,21 +214,40 @@ struct Asked {
     failed: Option<String>,
 }
 
+/// A diff as it was shown: what it was of, its text, and the order of its files.
+type Shown = (Option<String>, Arc<str>, Vec<usize>);
+
+/// Changed lines, each by its file's place in the diff, its side and its number.
+type Seen = HashSet<(u32, Side, u32)>;
+
+/// Something done to a ref that `z` takes back.
+enum Did {
+    /// The ref, by its full name and the commit it named: it is in `dropped`.
+    Dropped(String, String),
+    /// The ref, by its full name: its branch is in `branches`.
+    Took(String),
+}
+
 struct Answer {
     patch: Arc<str>,
-    /// The commit the diff is of, when it is one commit's.
-    sha: Option<String>,
+    /// What the diff is of: a commit's hash, or a ref's [`whole_key`].
+    key: Option<String>,
     result: Result<agent::Report, String>,
+    /// Asked about the diff on screen, not ahead of the reader.
+    shown: bool,
 }
 
 /// At most this many questions are out at once; a diff shown while they are isn't asked
 /// about on its own (`a` asks).
 const ASKING_AT_ONCE: usize = 3;
+/// The most commits of one ref the model is asked about without their being opened.
+const LOOK_AHEAD: usize = 40;
 
-/// A take in the window: the ref as it was when asked, and how far the signing has got.
+/// A take in the window: the ref as it was when taken, and how far the signing has got.
 struct TakeView {
     r: RefInfo,
-    branch: String,
+    /// Commit by commit, or as one: fixed when the take starts.
+    way: Way,
     phase: Phase,
     /// The commits whose copies exist, and whether each was kept from an earlier take.
     signed: HashMap<String, bool>,
@@ -205,11 +259,14 @@ struct TakeView {
 
 #[derive(PartialEq, Debug)]
 enum Phase {
-    /// Asked, not started. `Some` says why it can't start.
-    Confirm(Option<String>),
     Running,
-    Done { tip: String, count: usize },
-    Failed(String),
+    /// Stopped with signatures still to make: by the reader (`None`), or by a failure.
+    Paused(Option<String>),
+}
+
+/// What a ref's whole change is filed under: its name and the commit it named.
+fn whole_key(r: &RefInfo) -> String {
+    format!("{}@{}", r.name, r.tip)
 }
 
 /// A row by what it shows, not where it is: the ref's name and the commit's hash (`None` for
@@ -272,6 +329,9 @@ impl State {
     }
 
     fn empty(patterns: Vec<String>, reviewed: Reviewed, taken: Taken, patient: bool) -> State {
+        // Long lines wrap: no line of a change is ever cut off, and a note has its line's end.
+        let mut diff = DiffState::new(Vec::new());
+        diff.set_wrap(true);
         State {
             repo: None,
             patterns,
@@ -279,7 +339,7 @@ impl State {
             refs: Vec::new(),
             items: Vec::new(),
             sel: 0,
-            diff: DiffState::new(Vec::new()),
+            diff,
             patch: Latest::default(),
             loading: false,
             reviewed,
@@ -292,7 +352,22 @@ impl State {
             marks: HashMap::new(),
             marking: Latest::default(),
             reports: HashMap::new(),
-            noted: HashMap::new(),
+            levels: HashMap::new(),
+            seen_by: HashMap::new(),
+            shown_key: None,
+            took: HashMap::new(),
+            took_one: HashSet::new(),
+            preread: HashSet::new(),
+            ahead: Arc::default(),
+            empty_drawn: std::cell::Cell::new(false),
+            partial: HashSet::new(),
+            head: None,
+            dropped: Vec::new(),
+            undo: Vec::new(),
+            keys_open: false,
+            open_note: None,
+            note_at: 0,
+            visible_file: 0,
             answers: channel(),
             asking: 0,
             agent: agent::Agent::from_env(),
@@ -333,12 +408,24 @@ impl State {
         }
         self.items = items(&self.refs);
         self.sel = was.and_then(|id| self.position(&id)).unwrap_or(0);
+        self.head = repo.head_branch();
         // The copies are looked up under the lock; git is asked about them after it is let go.
-        let copies: Vec<(usize, String)> = {
+        let copies: Vec<(usize, Way, String)> = {
             let taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
-            self.refs.iter().enumerate().filter_map(|(i, r)| Some((i, taken.get(&r.tip)?.to_owned()))).collect()
+            let of = |i: usize, way: Way, key: &str| Some((i, way, taken.get(key)?.to_owned()));
+            self.refs.iter().enumerate().flat_map(|(i, r)| [of(i, Way::Each, &r.tip), of(i, Way::One, &take::one_key(r))]).flatten().collect()
         };
-        self.branches = copies.iter().filter_map(|(i, copy)| Some((self.refs[*i].name.clone(), take::taken_as(repo, copy, &self.refs[*i])?))).collect();
+        (self.branches, self.took, self.took_one) = Default::default();
+        for (i, way, copy) in copies {
+            let r = &self.refs[i];
+            if let Some(branch) = take::taken_as(repo, &copy, way, r) {
+                self.branches.insert(r.name.clone(), branch);
+                self.took.insert(r.name.clone(), copy);
+                if way == Way::One {
+                    self.took_one.insert(r.name.clone());
+                }
+            }
+        }
         // Which commits change something the host runs: one git call a commit, so not here.
         let shas: Vec<String> = self.refs.iter().flat_map(|r| &r.commits).map(|c| c.sha.clone()).filter(|sha| !self.marks.contains_key(sha)).collect();
         if !shas.is_empty() {
@@ -422,19 +509,94 @@ impl State {
         self.order.get(f.file).copied()
     }
 
-    /// Puts the agent's notes for this diff under the lines they are about.
-    fn annotate(&mut self) {
-        let notes = match self.report().and_then(|a| a.report.as_ref()) {
-            Some(report) => report
-                .findings
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| f.line > 0)
-                .filter_map(|(i, f)| Some(Annotation::new(self.file_of(f)?, LineRef::new(Side::New, f.line), i.to_string())))
-                .collect(),
-            None => Vec::new(),
+    /// Finding `id` (an annotation's id) of the diff on screen.
+    fn finding(&self, id: &str) -> Option<&agent::Finding> {
+        self.report()?.report.as_ref()?.findings.get(id.parse::<usize>().ok()?)
+    }
+
+    /// Where each of the agent's notes goes in the diff on screen: its file and line. A note
+    /// on a whole file goes on the file's first line, and one whose file can't be told (the
+    /// patch and the diff don't line up) on the first line of all, so none is ever dropped.
+    fn placed(&self) -> Vec<(usize, usize, LineRef)> {
+        let Some(report) = self.report().and_then(|a| a.report.as_ref()) else { return Vec::new() };
+        let first = |file: usize| {
+            let f = self.diff.files().get(file)?;
+            // A file with no lines has one row, and its notes go under that.
+            if f.hunks.is_empty() {
+                return Some(LineRef::new(Side::New, 0));
+            }
+            let l = f.hunks.first()?.lines.first()?;
+            Some(match (l.new, l.old) {
+                (Some(n), _) => LineRef::new(Side::New, n),
+                (None, Some(n)) => LineRef::new(Side::Old, n),
+                (None, None) => return None,
+            })
         };
+        let somewhere = (0..self.diff.files().len()).find_map(|f| Some((f, first(f)?)));
+        report
+            .findings
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let lined = |file: usize| self.diff.files().get(file).is_some_and(|f| !f.hunks.is_empty());
+                let at = self.file_of(f).and_then(|file| Some((file, if f.line > 0 && lined(file) { LineRef::new(Side::New, f.line) } else { first(file)? })));
+                let (file, at) = at.or(somewhere)?;
+                Some((i, file, at))
+            })
+            .collect()
+    }
+
+    /// Puts the agent's notes for this diff on the lines they are about.
+    fn annotate(&mut self) {
+        let notes = self.placed().into_iter().map(|(i, file, at)| Annotation::new(file, at, i.to_string())).collect();
         self.diff.set_annotations(notes);
+    }
+
+    /// Notes and alarms on each file of the diff on screen.
+    fn file_levels(&self) -> Vec<(usize, usize)> {
+        let mut out = vec![(0, 0); self.diff.files().len()];
+        for (i, file, _) in self.placed() {
+            match self.finding(&i.to_string()).is_some_and(|f| f.alarm) {
+                true => out[file].1 += 1,
+                false => out[file].0 += 1,
+            }
+        }
+        out
+    }
+
+    /// The lines of the diff on screen that carry a note, and whether it is an alarm.
+    fn line_levels(&self) -> HashMap<(usize, u32), bool> {
+        let mut out = HashMap::new();
+        for (i, file, at) in self.placed() {
+            let alarm = self.finding(&i.to_string()).is_some_and(|f| f.alarm);
+            *out.entry((file, at.line)).or_insert(false) |= alarm;
+        }
+        out
+    }
+
+    /// Notes and alarms on everything of a ref the agent has read.
+    fn ref_level(&self, r: &RefInfo) -> (usize, usize) {
+        let keys = r.commits.iter().map(|c| c.sha.clone()).chain([whole_key(r)]);
+        keys.filter_map(|k| self.levels.get(&k)).fold((0, 0), |(n, a), &(notes, alarms)| (n + notes, a + alarms))
+    }
+
+    /// Goes to the agent's next note on this diff, alarms first, and opens it.
+    fn next_note(&mut self, tx: &mut Tx) {
+        let mut placed = self.placed();
+        placed.sort_by_key(|(i, _, _)| !self.finding(&i.to_string()).is_some_and(|f| f.alarm));
+        if placed.is_empty() {
+            return;
+        }
+        let (i, file, at) = placed[self.note_at % placed.len()];
+        self.note_at = (self.note_at + 1) % placed.len();
+        self.open_note = Some(i.to_string());
+        self.diff.scroll_to_line(file, at, tx);
+    }
+
+    /// What the selection's diff is filed under.
+    fn key(&self) -> Option<String> {
+        let (r, c) = self.selected()?;
+        self.snapshot.is_none().then(|| c.map_or_else(|| whole_key(r), |c| c.sha.clone()))
     }
 
     /// Asks the agent about the diff on screen, on a thread of its own: the window goes on
@@ -444,6 +606,7 @@ impl State {
         if self.loading || self.diff.files().is_empty() {
             return;
         }
+        let key = self.key();
         let asked = self.reports.entry(self.patch_text.clone()).or_default();
         if asked.waiting {
             return;
@@ -451,22 +614,80 @@ impl State {
         asked.waiting = true;
         asked.failed = None;
         self.asking += 1;
-        let sha = self.selected().and_then(|(_, c)| Some(c?.sha.clone()));
         let (agent, patch, send, waker) = (self.agent.clone(), self.patch_text.clone(), self.answers.0.clone(), self.waker.clone());
         std::thread::spawn(move || {
             let result = agent.ask(&patch, fresh);
-            let _ = send.send(Answer { patch, sha, result });
+            let _ = send.send(Answer { patch, key, result, shown: true });
             if let Some(wake) = &waker {
                 wake();
             }
         });
     }
 
-    /// Files an answer under its diff. What an earlier look found stays.
+    /// With a ref's whole change on screen, asks the model about each of its commits too:
+    /// at most [`LOOK_AHEAD`] of a ref, one at a time for the whole window, on one thread that
+    /// goes through a queue. Their diffs are not being read, so this is where something that
+    /// came and went between commits can still show: as a mark on that commit's stop, and on
+    /// the ref.
+    fn look_ahead(&mut self) {
+        let (Some(repo), Some((r, None))) = (self.repo.clone(), self.selected()) else { return };
+        if !self.auto_agent || self.snapshot.is_some() {
+            return;
+        }
+        let had = r.commits.iter().filter(|c| self.preread.contains(&c.sha)).count();
+        let shas: Vec<String> = r.commits.iter().map(|c| c.sha.clone()).filter(|sha| !self.levels.contains_key(sha) && !self.preread.contains(sha)).take(LOOK_AHEAD.saturating_sub(had)).collect();
+        if shas.is_empty() {
+            return;
+        }
+        self.preread.extend(shas.iter().cloned());
+        let start = {
+            let mut q = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
+            q.0.extend(shas);
+            !std::mem::replace(&mut q.1, true)
+        };
+        if !start {
+            return;
+        }
+        let (agent, send, waker, queue) = (self.agent.clone(), self.answers.0.clone(), self.waker.clone(), self.ahead.clone());
+        std::thread::spawn(move || {
+            loop {
+                let sha = {
+                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                    match q.0.pop_front() {
+                        Some(sha) => sha,
+                        None => {
+                            q.1 = false;
+                            return;
+                        }
+                    }
+                };
+                let Ok(patch) = repo.commit_patch(&sha) else { continue };
+                let patch: Arc<str> = Arc::from(patch);
+                let result = agent.ask(&patch, false);
+                // The window is gone: nothing more is asked.
+                if send.send(Answer { patch, key: Some(sha), result, shown: false }).is_err() {
+                    return;
+                }
+                if let Some(wake) = &waker {
+                    wake();
+                }
+            }
+        });
+    }
+
+    /// Files an answer under its diff. What an earlier look found stays, whichever look it
+    /// was: a look ahead adds its findings and leaves a look the reader is waiting for to land
+    /// on its own; one that failed says nothing, and the commit is asked about when opened.
     fn answered(&mut self, answer: Answer) {
-        self.asking = self.asking.saturating_sub(1);
+        if answer.shown {
+            self.asking = self.asking.saturating_sub(1);
+        } else if answer.result.is_err() {
+            return;
+        }
         let asked = self.reports.entry(answer.patch.clone()).or_default();
-        asked.waiting = false;
+        if answer.shown {
+            asked.waiting = false;
+        }
         match answer.result {
             Ok(mut new) => {
                 if let Some(old) = asked.report.take() {
@@ -474,8 +695,8 @@ impl State {
                     new.findings.extend(more);
                     new.dropped = new.dropped.max(old.dropped);
                 }
-                if let Some(sha) = answer.sha {
-                    self.noted.insert(sha, new.findings.len());
+                if let Some(key) = answer.key {
+                    self.levels.insert(key, level(&new));
                 }
                 asked.report = Some(new);
             }
@@ -489,6 +710,7 @@ impl State {
     /// Everything other threads have ready; whether anything changed.
     fn poll(&mut self) -> bool {
         let mut changed = self.land();
+        self.seen_more();
         if let Some(marks) = self.marking.take() {
             self.marks.extend(marks);
             changed = true;
@@ -500,49 +722,137 @@ impl State {
         changed | self.take_steps()
     }
 
-    /// Opens the take for the selection's ref: a question first, nothing is signed yet.
-    fn ask_take(&mut self) {
-        // One take at a time, and its panel is left with Esc, not replaced.
-        if self.take.is_some() {
+    /// Signatures are being made: nothing else writes until that stops.
+    fn signing(&self) -> bool {
+        self.take.as_ref().is_some_and(|t| t.phase == Phase::Running)
+    }
+
+    /// Every commit of `r` has been read, and it is a ref that can be taken at all. What the
+    /// model says is not asked; only that a first look at the diff on screen isn't still out,
+    /// so an alarm on its way is not missed by a quick press.
+    fn ready(&self, r: &RefInfo) -> bool {
+        self.way(r).is_some() && !self.report().is_some_and(|a| a.waiting && a.report.is_none())
+    }
+
+    /// How `r` would be taken now, if it can be: commit by commit when every commit has been
+    /// read, as one commit when only its whole change has.
+    fn way(&self, r: &RefInfo) -> Option<Way> {
+        if r.error.is_some() || r.truncated || r.commits.is_empty() {
+            None
+        } else if r.commits.iter().all(|c| self.reviewed.has(&c.sha)) {
+            Some(Way::Each)
+        } else {
+            self.reviewed.has(&take::whole_mark(r)).then_some(Way::One)
+        }
+    }
+
+    /// How the Take button would take `r`: as it can be taken now, or else as what is on
+    /// screen would let it be once read.
+    fn way_shown(&self, r: &RefInfo) -> Way {
+        self.way(r).unwrap_or(match self.selected() {
+            Some((on, None)) if on.name == r.name => Way::One,
+            _ => Way::Each,
+        })
+    }
+
+    /// How much of `r` has been read, from 0 to 1: its read commits, and as much of the diff
+    /// on screen as has been seen when that is more.
+    fn progress(&self, r: &RefInfo) -> f32 {
+        let n = r.commits.len().max(1) as f32;
+        if self.reviewed.has(&take::whole_mark(r)) {
+            return 1.0;
+        }
+        let read = r.commits.iter().filter(|c| self.reviewed.has(&c.sha)).count() as f32;
+        let (seen, all) = self.diff.read();
+        let here = if self.loading || all == 0 { 0.0 } else { seen as f32 / all as f32 };
+        match self.selected() {
+            Some((on, None)) if on.name == r.name => (read / n).max(here),
+            Some((on, Some(c))) if on.name == r.name && !self.reviewed.has(&c.sha) => (read + here) / n,
+            _ => read / n,
+        }
+    }
+
+    /// A changed line has been on screen for the first time, or a diff has just landed: once
+    /// every one of its changed lines has been, what it shows is read. A ref's whole change
+    /// is read as itself ([`take::whole_mark`]), not as its commits: what went on in between
+    /// was not on screen. Nothing asks the reader to say so.
+    fn seen_more(&mut self) {
+        if self.loading || self.error.is_some() || self.snapshot.is_some() {
             return;
         }
-        if self.snapshot.is_some() {
-            self.notice = Some("A folder snapshot has no commits to take. Apply it with jail apply.".to_owned());
+        let (seen, all) = self.diff.read();
+        let Some((r, c)) = self.selected() else { return };
+        // Never before a frame of it was drawn: a diff with files counts once its rows have
+        // been laid out in the window, and one with none (an empty commit, a ref whose
+        // commits cancel out) once the page saying so has been built.
+        let drawn = if self.diff.files().is_empty() { self.empty_drawn.get() } else { self.diff.laid() };
+        if !drawn {
             return;
         }
-        let Some((r, _)) = self.selected() else { return };
+        let shas: Vec<String> = match c {
+            Some(c) => vec![c.sha.clone()],
+            None => vec![take::whole_mark(r)],
+        };
+        if seen < all {
+            if c.is_some() {
+                self.partial.extend(shas);
+            }
+            return;
+        }
+        let new: Vec<&str> = shas.iter().map(String::as_str).filter(|sha| !self.reviewed.has(sha)).collect();
+        if !new.is_empty() {
+            // The marks hold for this run either way.
+            self.notice = self.reviewed.set(&new, true).err().map(|e| format!("Couldn't save what has been read: {e}"));
+        }
+        for sha in &shas {
+            self.partial.remove(sha);
+        }
+    }
+
+    /// Takes the selection's ref: signs a copy of each commit, then makes the branch. On its
+    /// own thread: each signature may wait for a touch. A ref that isn't ready says why.
+    fn take_now(&mut self) {
+        if self.signing() {
+            return;
+        }
+        // An empty diff has no rows to report being seen: its page, drawn, is asked after here.
+        self.seen_more();
+        let (Some(repo), Some((r, _))) = (self.repo.clone(), self.selected()) else { return };
+        if self.snapshot.is_some() || self.branches.contains_key(&r.name) {
+            return;
+        }
         let r = r.clone();
-        let branch = take::branch_for(&r);
-        let unread = r.commits.iter().filter(|c| !self.reviewed.has(&c.sha)).count();
-        let blocked = if let Some(branch) = self.branches.get(&r.name) {
-            Some(format!("Already taken: the branch {branch} is its signed copy."))
-        } else if r.error.is_some() || r.commits.is_empty() {
+        // A paused take goes on the way it began: its beads are of that take.
+        let paused = self.take.as_ref().filter(|t| t.r.name == r.name && t.r.tip == r.tip).map(|t| t.way);
+        let way = paused.or_else(|| self.way(&r));
+        let unread = if way.is_some() { 0 } else { r.commits.iter().filter(|c| !self.reviewed.has(&c.sha)).count() };
+        let (seen, all) = self.diff.read();
+        let blocked = if r.error.is_some() || r.commits.is_empty() {
             Some("There is nothing on this ref to take.".to_owned())
         } else if r.truncated {
             Some(format!("This ref has more than {} commits; only the listed ones can be read here, so it can't be taken here.", git::MAX_COMMITS))
+        } else if unread > 0 && seen < all {
+            Some(format!("{} of this change {} not been on screen yet. The dim part of the map is what is left.", plural(all - seen, "line"), if all - seen == 1 { "has" } else { "have" }))
         } else if unread > 0 {
-            Some(format!("{unread} of its {} aren't marked reviewed yet. Read them and press r on each first.", plural(r.commits.len(), "commit")))
+            Some(format!("{} of its {} not read yet, nor its whole change.", unread, plural(r.commits.len(), "commit")))
+        } else if !self.ready(&r) {
+            Some("The model is still reading this.".to_owned())
         } else {
             None
         };
-        self.take = Some(TakeView { r, branch, phase: Phase::Confirm(blocked), signed: HashMap::new(), signing: None, steps: None, cancel: Arc::default() });
-    }
-
-    /// Starts the signing, on its own thread: each signature may wait for a touch.
-    fn start_take(&mut self) {
-        let (Some(repo), Some(t)) = (self.repo.clone(), self.take.as_mut()) else { return };
-        if !matches!(t.phase, Phase::Confirm(None) | Phase::Failed(_)) {
+        if let Some(why) = blocked {
+            self.notice = Some(why);
             return;
         }
+        self.notice = None;
         let (send, steps) = channel();
-        t.phase = Phase::Running;
-        t.signing = None;
-        t.steps = Some(steps);
-        t.cancel = Arc::default();
-        let (r, branch, cancel) = (t.r.clone(), t.branch.clone(), t.cancel.clone());
+        let branch = take::branch_for(&r);
+        let cancel: Arc<AtomicBool> = Arc::default();
+        let Some(way) = way else { return };
+        self.take = Some(TakeView { r: r.clone(), way, phase: Phase::Running, signed: HashMap::new(), signing: None, steps: Some(steps), cancel: cancel.clone() });
         let (reviewed, taken, waker) = (self.reviewed.all(), self.taken.clone(), self.waker.clone());
         std::thread::spawn(move || {
-            take::run(&repo, &r, &branch, &reviewed, &taken, &cancel, &mut |step| {
+            take::run(&repo, &r, &branch, way, &reviewed, &taken, &cancel, &mut |step| {
                 let _ = send.send(step);
                 if let Some(wake) = &waker {
                     wake();
@@ -556,7 +866,7 @@ impl State {
         let Some(t) = &mut self.take else { return false };
         let Some(steps) = &t.steps else { return false };
         let mut changed = false;
-        let mut finished = false;
+        let mut done = None;
         for step in steps.try_iter() {
             changed = true;
             match step {
@@ -565,33 +875,141 @@ impl State {
                     t.signing = None;
                     t.signed.insert(sha, reused);
                 }
-                Step::Done { tip, count, .. } => {
-                    t.phase = Phase::Done { tip, count };
-                    finished = true;
-                }
+                Step::Done { .. } => done = Some(true),
                 Step::Failed(e) => {
                     t.signing = None;
-                    t.phase = Phase::Failed(if e == git::CANCELLED { "Stopped. The signatures made so far are kept.".to_owned() } else { e });
-                    finished = true;
+                    // Stopped by the reader says nothing: the beads show where it got to.
+                    t.phase = Phase::Paused((e != git::CANCELLED).then_some(e));
+                    done = Some(false);
                 }
             }
         }
-        if finished {
-            t.steps = None;
-            if matches!(t.phase, Phase::Done { .. }) {
-                // The sidebar now says the ref is taken.
+        match done {
+            Some(true) => {
+                let name = t.r.name.clone();
+                self.take = None;
+                self.undo.push(Did::Took(name));
+                // The sidebar now draws the branch.
                 self.reload();
             }
+            Some(false) => t.steps = None,
+            None => {}
         }
         changed
     }
 
-    /// Escape in a take: stop the signing, or close the panel when nothing is running.
-    fn leave_take(&mut self) {
-        match &self.take {
-            Some(t) if t.phase == Phase::Running => t.cancel.store(true, Ordering::Relaxed),
-            _ => self.take = None,
+    /// Stops the signing after the signature being made. Those made are kept, so taking
+    /// again goes on from there.
+    fn pause_take(&mut self) {
+        if let Some(t) = self.take.as_ref().filter(|t| t.phase == Phase::Running) {
+            t.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Drops the selection's ref: deletes it, and keeps it struck out in the sidebar. Its
+    /// commits stay in the repository until git prunes them, so `z` puts it back.
+    fn drop_ref(&mut self) {
+        if self.take.as_ref().is_some_and(|t| t.phase == Phase::Running) || self.snapshot.is_some() {
+            return;
+        }
+        let (Some(repo), Some((r, _))) = (self.repo.clone(), self.selected()) else { return };
+        let r = r.clone();
+        match repo.delete_ref(&r.name, &r.tip) {
+            Ok(()) => {
+                self.notice = None;
+                if self.take.as_ref().is_some_and(|t| t.r.name == r.name) {
+                    self.take = None;
+                }
+                self.undo.push(Did::Dropped(r.name.clone(), r.tip.clone()));
+                self.dropped.push(r);
+                self.reload();
+            }
+            Err(e) => self.notice = Some(format!("Couldn't drop it: {e}")),
+        }
+    }
+
+    /// Puts a dropped ref back where it was.
+    fn restore(&mut self, name: &str, tip: &str) {
+        if self.signing() {
+            return;
+        }
+        let (Some(repo), Some(at)) = (self.repo.clone(), self.dropped.iter().position(|d| d.name == name && d.tip == tip)) else { return };
+        match repo.restore_ref(name, tip) {
+            Ok(()) => {
+                self.dropped.remove(at);
+                self.undo.retain(|d| !matches!(d, Did::Dropped(n, t) if n == name && t == tip));
+                self.notice = None;
+                self.reload();
+            }
+            Err(e) => self.notice = Some(format!("Couldn't put it back: {e}")),
+        }
+    }
+
+    /// Takes back the take of `name`: deletes the branch it made. The signed copies stay, so
+    /// taking again asks for no touch.
+    fn untake(&mut self, name: &str) {
+        if self.signing() {
+            return;
+        }
+        let (Some(repo), Some(branch), Some(tip)) = (self.repo.clone(), self.branches.get(name).cloned(), self.took.get(name).cloned()) else { return };
+        // Asked now, not remembered: the checkout may have moved since the refs were listed.
+        self.head = repo.head_branch();
+        if self.head.as_deref() == Some(&branch) {
+            self.notice = Some(format!("You are on {branch}. Switch away from it first."));
+            return;
+        }
+        // Only at the commit the take left it on: a branch that has moved since has work of
+        // its own, and git refuses.
+        match repo.delete_branch(&branch, &tip) {
+            Ok(()) => {
+                self.undo.retain(|d| !matches!(d, Did::Took(n) if n == name));
+                self.notice = None;
+                self.reload();
+            }
+            Err(e) => {
+                self.notice = Some(format!("Couldn't undo the take: {e}"));
+                // What is drawn may be out of date: that is one way to get here.
+                self.reload();
+            }
+        }
+    }
+
+    /// Undo on the strip: the selection's take.
+    fn undo_take(&mut self) {
+        if let Some(name) = self.selected().map(|(r, _)| r.name.clone()) {
+            self.untake(&name);
+        }
+    }
+
+    /// `z`: takes back the last take or drop.
+    fn undo_last(&mut self) {
+        match self.undo.last() {
+            Some(Did::Dropped(name, tip)) => self.restore(&name.clone(), &tip.clone()),
+            Some(Did::Took(name)) => self.untake(&name.clone()),
+            None => {}
+        }
+    }
+
+    /// Switches the checkout to the branch the selection's ref was taken as. The one thing
+    /// here that changes the working tree, and only on this press.
+    fn switch_to(&mut self) {
+        let (Some(repo), Some((r, _))) = (self.repo.clone(), self.selected()) else { return };
+        let (Some(branch), Some(tip)) = (self.branches.get(&r.name).cloned(), self.took.get(&r.name).cloned()) else { return };
+        if self.signing() {
+            return;
+        }
+        self.head = repo.head_branch();
+        if self.head.as_deref() == Some(&branch) {
+            return;
+        }
+        // Only to what was taken: a branch that moved since the refs were listed is not it.
+        if repo.branch_tip(&branch).ok().flatten().as_deref() != Some(&tip) {
+            self.notice = Some(format!("{branch} is no longer where the take left it."));
+            self.reload();
+            return;
+        }
+        self.notice = repo.switch(&branch).err().map(|e| format!("git switch: {e}"));
+        self.head = repo.head_branch();
     }
 
     /// Asks a worker for the selection's patch. The last selection's diff goes at once, so the
@@ -599,6 +1017,14 @@ impl State {
     /// [`QUICK`] and land before the next frame; a slower one shows "Reading" until `poll`
     /// takes it.
     fn load(&mut self) {
+        // What was seen of the diff going away is kept for when it is back.
+        if !self.patch_text.is_empty() {
+            self.seen_by.insert((self.shown_key.take(), self.patch_text.clone(), self.order.clone()), self.diff.seen().clone());
+        }
+        self.open_note = None;
+        self.note_at = 0;
+        self.visible_file = 0;
+        self.empty_drawn.set(false);
         self.patch_text = Arc::from("");
         self.show(Vec::new(), &[], 0);
         self.annotate();
@@ -642,11 +1068,22 @@ impl State {
                 let sections = read.patch.lines().filter(|l| l.starts_with("diff --git ")).count();
                 self.show(parse(&read.patch), &read.modes, sections);
                 self.patch_text = Arc::from(read.patch);
+                self.shown_key = self.key();
+                if let Some(seen) = self.seen_by.get(&(self.shown_key.clone(), self.patch_text.clone(), self.order.clone())) {
+                    self.diff.set_seen(seen.clone());
+                }
+                // Notes kept from the same patch under another commit count for this one too.
+                if let (Some(key), Some(report)) = (self.shown_key.clone(), self.report().and_then(|a| a.report.as_ref())) {
+                    self.levels.insert(key, level(report));
+                }
                 self.annotate();
+                // A diff with no lines to read (a mode change, a move) is read once shown.
+                self.seen_more();
                 // The second reader starts on its own; the diff is already up.
                 if self.auto_agent && self.report().is_none() && self.asking < ASKING_AT_ONCE {
                     self.ask_agent(false);
                 }
+                self.look_ahead();
             }
             Err(e) => self.error = Some(e),
         }
@@ -654,8 +1091,8 @@ impl State {
     }
 
     fn select(&mut self, i: usize, tx: &mut Tx) {
-        // Nothing under a take moves: its commits and their marks are as they were asked about.
-        if self.take.is_some() || i >= self.items.len() || i == self.sel {
+        // Nothing moves while signatures are being made.
+        if self.take.as_ref().is_some_and(|t| t.phase == Phase::Running) || i >= self.items.len() || i == self.sel {
             return;
         }
         self.sel = i;
@@ -668,38 +1105,31 @@ impl State {
         tx.scroll_into_view(item_key(i));
     }
 
+    /// `n` and `p`: the next or previous commit. A ref's whole change is not on this path:
+    /// reading it is a choice (it decides how the ref is taken), not a stop on the way.
     fn step(&mut self, forward: bool, tx: &mut Tx) {
-        let to = if forward { self.sel + 1 } else { self.sel.wrapping_sub(1) };
-        self.select(to, tx);
-    }
-
-    fn is_reviewed(&self, it: Item) -> bool {
-        let r = &self.refs[it.r];
-        match it.pick {
-            // A folder snapshot has no commits: nothing there is marked.
-            Pick::All => !r.commits.is_empty() && r.commits.iter().all(|c| self.reviewed.has(&c.sha)),
-            Pick::Commit(c) => self.reviewed.has(&r.commits[c].sha),
+        let mut to = self.sel;
+        loop {
+            to = if forward { to + 1 } else { to.wrapping_sub(1) };
+            match self.items.get(to) {
+                Some(it) if it.pick == Pick::All => continue,
+                Some(_) => return self.select(to, tx),
+                None => return,
+            }
         }
     }
 
-    /// Marks the selection read, or unread when it already is. A whole ref marks its commits.
-    fn toggle_reviewed(&mut self) {
-        if self.take.is_some() {
-            return;
-        }
-        if self.snapshot.is_some() {
-            self.notice = Some("A folder snapshot has no commits to mark. Apply it with jail apply once you've read it.".to_owned());
-            return;
-        }
-        let Some(&it) = self.items.get(self.sel) else { return };
-        let on = !self.is_reviewed(it);
-        let r = &self.refs[it.r];
-        let shas: Vec<&str> = match it.pick {
-            Pick::All => r.commits.iter().map(|c| c.sha.as_str()).collect(),
-            Pick::Commit(c) => vec![r.commits[c].sha.as_str()],
+    /// `N` and `P`: the next or previous ref, at its first row: its whole change, or its one
+    /// commit when that is the same thing.
+    fn step_ref(&mut self, forward: bool, tx: &mut Tx) {
+        let Some(at) = self.items.get(self.sel).map(|it| it.r) else { return };
+        let to = match forward {
+            true => self.items.iter().position(|it| it.r > at),
+            false => self.items.iter().rev().find(|it| it.r < at).map(|it| it.r).and_then(|r| self.items.iter().position(|it| it.r == r)),
         };
-        // The marks hold for this run either way; the diff stays up.
-        self.notice = self.reviewed.set(&shas, on).err().map(|e| format!("Couldn't save the reviewed list: {e}"));
+        if let Some(to) = to {
+            self.select(to, tx);
+        }
     }
 
     /// Lands at once. A spring here moved every line sideways through the other pane's text,
@@ -730,6 +1160,12 @@ fn items(refs: &[RefInfo]) -> Vec<Item> {
     out
 }
 
+/// How many notes and how many alarms a report holds.
+fn level(report: &agent::Report) -> (usize, usize) {
+    let alarms = report.findings.iter().filter(|f| f.alarm).count();
+    (report.findings.len() - alarms, alarms)
+}
+
 fn item_key(i: usize) -> String {
     format!("item-{i}")
 }
@@ -738,423 +1174,22 @@ fn plural(n: usize, one: &str) -> String {
     if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") }
 }
 
-fn view(s: &State, cx: &mut Cx<State>) -> El {
-    let k = Kit::neutral(cx.system_dark());
-    let main = col().key("main").grow(1.0).min_w(0.0).h_full().child(header(s, &k)).child(body(s, &k)).child(footer(s, &k));
-    row().w_full().h_full().fill(k.c.bg_base).child(sidebar(s, &k)).child(main)
-}
-
-fn sidebar(s: &State, k: &Kit) -> El {
-    let title = match &s.repo {
-        Some(repo) => repo.name(),
-        None => "refview".to_owned(),
-    };
-    let count = match s.snapshot {
-        Some(_) => "a folder's jail snapshot".to_owned(),
-        None => format!("{} to review", plural(s.refs.iter().filter(|r| !r.commits.is_empty()).count(), "ref")),
-    };
-    let head = col()
-        .px(12.0)
-        .py(10.0)
-        .gap(2.0)
-        .child(text(title).font(k.ty.ui_medium).color(k.c.text_base).truncate())
-        .child(text(count).font(k.ty.text_small).color(k.c.text_muted));
-    let mut list = col().w_full().px(6.0).pb(8.0).gap(1.0);
-    let mut i = 0;
-    for (r, info) in s.refs.iter().enumerate() {
-        list = list.child(ref_header(info, k));
-        let note = |t: String| row().w_full().px(10.0).py(6.0).child(text(t).font(k.ty.text_small).color(k.c.text_faint).wrap());
-        if let Some(e) = &info.error {
-            list = list.child(note(format!("Couldn't read this ref: {e}")));
-        } else if info.commits.is_empty() {
-            list = list.child(note("Nothing HEAD doesn't already have".to_owned()));
-        } else if info.truncated {
-            // Oldest first, so the ones left out would have come before these.
-            list = list.child(note(format!("Older commits not listed: showing the newest {}", git::MAX_COMMITS)));
-        }
-        if let Some(branch) = s.branches.get(&info.name) {
-            list = list.child(row().w_full().px(10.0).pb(4.0).child(text(format!("Taken as branch {branch}")).font(k.ty.text_small).color(k.c.success.icon).truncate()));
-        }
-        while let Some(&it) = s.items.get(i).filter(|it| it.r == r) {
-            list = list.child(item_row(s, i, it, k));
-            i += 1;
-        }
-    }
-    let scroll = col().key("refs").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(list);
-    col().key("sidebar").w(300.0).h_full().fill(k.c.layer_01).child(head).child(scroll)
-}
-
-fn ref_header(info: &RefInfo, k: &Kit) -> El {
-    let count = text(info.commits.len().to_string()).font(k.ty.text_xsmall_medium).color(k.c.text_faint);
-    row()
-        .w_full()
-        .px(10.0)
-        .pt(12.0)
-        .pb(4.0)
-        .gap(8.0)
-        .items_center()
-        .child(text(info.short().to_owned()).font(k.ty.text_small_medium).color(k.c.text_muted).truncate().grow(1.0).min_w(0.0))
-        .child(count)
-}
-
-fn item_row(s: &State, i: usize, it: Item, k: &Kit) -> El {
-    let info = &s.refs[it.r];
-    let id = s.row_id(it);
-    let selected = i == s.sel;
-    let reviewed = s.is_reviewed(it);
-    let (title, detail, runs) = match it.pick {
-        Pick::All if s.snapshot.is_some() => ("All changes".to_owned(), "committed or not".to_owned(), 0),
-        Pick::All => ("All changes".to_owned(), plural(info.commits.len(), "commit"), 0),
-        Pick::Commit(c) => {
-            let c = &info.commits[c];
-            (c.subject.clone(), format!("{}  {}  {}", c.short, c.author, c.date), s.marks.get(&c.sha).copied().unwrap_or(0))
-        }
-    };
-    let flagged = id.1.as_ref().and_then(|sha| s.noted.get(sha)).copied().unwrap_or(0);
-    // A filled dot once read, a ring until then.
-    let dot = match reviewed {
-        true => el().size(8.0, 8.0).radius(4.0).fill(k.c.success.icon),
-        false => el().size(8.0, 8.0).radius(4.0).border(1.0, k.c.text_faint),
-    };
-    let ink = if reviewed && !selected { k.c.text_muted } else { k.c.text_base };
-    let lines = col()
-        .grow(1.0)
-        .min_w(0.0)
-        .gap(1.0)
-        .child(text(title.clone()).font(k.ty.ui).color(ink).truncate())
-        .child(text(detail).font(k.ty.text_xsmall).color(k.c.text_faint).truncate());
-    row()
-        .key(item_key(i))
-        .role("option")
-        .label(title)
-        .checked(reviewed)
-        .w_full()
-        .px(10.0)
-        .py(6.0)
-        .gap(10.0)
-        .items_center()
-        .radius(6.0)
-        .fill(if selected { k.c.layer_03 } else { k.c.layer_01 })
-        .hover(k.c.hover)
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.select_row(&id, tx))
-        .child(dot)
-        .child(lines)
-        .children(chips(runs, flagged, k))
-}
-
-/// What a commit's row says beside its title: how many of its files the host would run, and
-/// how many notes the agent left on it.
-fn chips(runs: usize, flagged: usize, k: &Kit) -> Vec<El> {
-    let chip = |label: String, says: String| {
-        row().px(5.0).py(1.0).radius(4.0).fill(k.c.warning.bg).label(says).child(text(label).font(k.ty.text_xsmall_medium).color(k.c.warning.fg))
-    };
-    let mut out = Vec::new();
-    if runs > 0 {
-        out.push(chip(format!("runs {runs}"), format!("{} the host would run", plural(runs, "file"))));
-    }
-    if flagged > 0 {
-        out.push(chip(format!("agent {flagged}"), format!("{} from the agent", plural(flagged, "note"))));
-    }
-    out
-}
-
-fn header(s: &State, k: &Kit) -> El {
-    let Some((info, commit)) = s.selected() else {
-        return row().key("bar").w_full().h(56.0).fill(k.c.layer_01);
-    };
-    let (title, meta, message) = match commit {
-        None if s.snapshot.is_some() => (info.name.clone(), "what jail diff shows  ·  apply it with jail apply".to_owned(), ""),
-        Some(c) => (c.subject.clone(), format!("{}  ·  {}  ·  {}  ·  {}", c.short, c.author, c.date, info.short()), c.body.as_str()),
-        None => {
-            let base = match &info.base {
-                Some(b) => format!("since {}", &b[..b.len().min(9)]),
-                None => "no history shared with HEAD".to_owned(),
-            };
-            (format!("All changes on {}", info.short()), format!("{}  ·  {base}", plural(info.commits.len(), "commit")), "")
-        }
-    };
-    let (adds, dels) = s.diff.files().iter().fold((0, 0), |(a, d), f| (a + f.additions(), d + f.deletions()));
-    let stats = row()
-        .gap(8.0)
-        .items_center()
-        .child(text(plural(s.diff.files().len(), "file")).font(k.ty.text_small).color(k.c.text_muted))
-        .child(text(format!("+{adds}")).key("adds").font(k.ty.text_small_medium).color(k.c.success.icon))
-        .child(text(format!("\u{2212}{dels}")).key("dels").font(k.ty.text_small_medium).color(k.c.danger.icon));
-    let split = s.diff.mode() == DiffMode::Split;
-    let modes = SegmentedControl::new(&["Unified", "Split"], Some(split as usize)).width(Some(150.0)).on_pick(
-        |s: &mut State, i, tx: &mut Tx| {
-            if (i == 1) != (s.diff.mode() == DiffMode::Split) {
-                s.toggle_split(tx);
-            }
-            // A click leaves focus on the segment; hand it back so the window reads as it did.
-            tx.blur();
-        },
-    );
-    let reviewed = s.items.get(s.sel).is_some_and(|&it| s.is_reviewed(it));
-    let mark = Button::new(if reviewed { "Reviewed" } else { "Mark reviewed" })
-        .variant(if reviewed { ButtonVariant::Ghost } else { ButtonVariant::Neutral })
-        .control_size(ControlSize::Regular)
-        .on_press_tx(|s: &mut State, tx: &mut Tx| {
-            s.toggle_reviewed();
-            tx.instant();
-            tx.blur();
-        })
-        .build(k)
-        .key("mark");
-    let titles = col()
-        .grow(1.0)
-        .min_w(0.0)
-        .gap(2.0)
-        .child(text(title).key("title").font(k.ty.ui_medium).color(k.c.text_base).truncate())
-        .child(text(meta).key("meta").font(k.ty.text_small).color(k.c.text_muted).truncate());
-    // No counts while the patch is still on its way: "0 files" would be a claim.
-    let stats = if s.loading { row() } else { stats };
-    let taken = s.branches.contains_key(&info.name);
-    let take = Button::new(if taken { "Taken" } else { "Take as branch" })
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Regular)
-        .on_press_tx(|s: &mut State, tx: &mut Tx| {
-            s.ask_take();
-            tx.instant();
-            tx.blur();
-        })
-        .build(k)
-        .key("take");
-    let mut top = row().w_full().gap(14.0).items_center().child(titles).child(stats).child(modes.build(k));
-    if s.snapshot.is_none() {
-        top = top.child(mark).child(take);
-    }
-    let mut bar = col().key("bar").w_full().px(16.0).py(10.0).gap(8.0).fill(k.c.layer_01).child(top);
-    if !message.is_empty() {
-        // The message was written in the sandbox too: shown as text to read, nothing more.
-        let msg = text(message.to_owned()).key("message").font(k.ty.text_small).color(k.c.text_muted).wrap().max_lines(6).selectable(true);
-        bar = bar.child(msg);
-    }
-    bar
-}
-
-fn body(s: &State, k: &Kit) -> El {
-    let note = |title: &str, detail: String| {
-        col()
-            .key("empty")
-            .grow(1.0)
-            .w_full()
-            .center()
-            .gap(6.0)
-            .padding(32.0)
-            .child(text(title.to_owned()).font(k.ty.ui_medium).color(k.c.text_base))
-            .child(text(detail).font(k.ty.text_small).color(k.c.text_muted).wrap())
-    };
-    if let Some(t) = &s.take {
-        return take_panel(t, k);
-    }
-    if let Some(e) = &s.error {
-        return note("Couldn't read that", e.clone());
-    }
-    if s.loading {
-        return note("Reading\u{2026}", "git is still producing this diff.".to_owned());
-    }
-    if s.items.is_empty() {
-        let patterns = s.patterns.join(", ");
-        let failed = s.refs.iter().filter(|r| r.error.is_some()).count();
-        if failed > 0 {
-            // Unread is not the same as nothing to read.
-            return note("Couldn't read the refs", format!("{} under {patterns} couldn't be listed; the sidebar says why.", plural(failed, "ref")));
-        }
-        let detail = match s.refs.is_empty() {
-            true => format!("No refs under {patterns}. Fetch some (jail fetch), then press u."),
-            false => format!("Every ref under {patterns} is already in HEAD."),
-        };
-        return note("Nothing to review", detail);
-    }
-    if s.diff.files().is_empty() {
-        return note("No changes", "This commit changes no files.".to_owned());
-    }
-    let warn = k.c.warning;
-    let small = k.ty.text_small;
-    let diff = DiffView::new(|s: &State| &s.diff, |s: &mut State| &mut s.diff)
-        // Why a file is marked, at the end of its header.
-        .header_actions(move |s: &State, file| match s.flags.get(file).copied().flatten() {
-            Some(why) => row().px(6.0).py(1.0).radius(4.0).fill(warn.bg).child(text(why.to_owned()).font(small).color(warn.fg)),
-            None => row(),
-        })
-        // The agent's note, under the line it is about.
-        .annotation(move |s: &State, a: &Annotation| {
-            let report = s.report().and_then(|a| a.report.as_ref());
-            let why = report.and_then(|r| r.findings.get(a.id.parse::<usize>().ok()?)).map_or("", |f| f.why.as_str());
-            row()
-                .w_full()
-                .px(12.0)
-                .py(6.0)
-                .gap(8.0)
-                .fill(warn.bg)
-                .child(text("Agent".to_owned()).font(small).color(warn.icon))
-                .child(text(why.to_owned()).font(small).color(warn.fg).wrap().grow(1.0).min_w(0.0))
-        })
-        .build(s, k);
-    col().key("review").grow(1.0).min_h(0.0).w_full().child(strip(s, k)).child(diff)
-}
-
-/// Above the diff: the files in it the host would run, and what the agent said. All of both,
-/// in a box that scrolls once it is taller than a third of a small window.
-fn strip(s: &State, k: &Kit) -> El {
-    let line = |t: String, ink| text(t).font(k.ty.text_small).color(ink).wrap();
-    let entry = |path: String, why: &str, press: El| {
-        press
-            .w_full()
-            .px(6.0)
-            .py(2.0)
-            .gap(8.0)
-            .radius(4.0)
-            .hover(k.c.hover)
-            .child(text(path).font(k.ty.text_small_medium).color(k.c.text_base).truncate())
-            .child(text(why.to_owned()).font(k.ty.text_small).color(k.c.text_muted).truncate().grow(1.0).min_w(0.0))
-    };
-    let mut out = col().w_full().px(16.0).py(8.0).gap(6.0);
-    let runs: Vec<(usize, risk::Why)> = s.flags.iter().enumerate().filter_map(|(i, f)| Some((i, (*f)?))).collect();
-    if !runs.is_empty() {
-        let mut box_ = col().key("runs").w_full().gap(1.0).child(line(format!("{} here would run on this machine, or change what does:", plural(runs.len(), "file")), k.c.warning.icon));
-        for &(i, why) in &runs {
-            let path = s.diff.files()[i].path().to_owned();
-            box_ = box_.child(entry(path, why, row().key(format!("run-{i}")).on_press_tx(move |s: &mut State, tx: &mut Tx| {
-                tx.instant();
-                s.diff.scroll_to_file(i, tx);
-            })));
-        }
-        out = out.child(box_);
-    }
-    let mut agent = col().key("agent").w_full().gap(1.0);
-    let asked = s.report();
-    match asked.and_then(|a| a.report.as_ref()) {
-        None if asked.is_some_and(|a| a.waiting) => agent = agent.child(line("The agent is reading this diff\u{2026}".to_owned(), k.c.text_muted)),
-        None if asked.is_some_and(|a| a.failed.is_some()) => {}
-        None => agent = agent.child(line("The agent hasn't read this diff. a  asks it; that sends the diff to Claude.".to_owned(), k.c.text_faint)),
-        Some(r) => {
-            agent = agent.child(match r.findings.len() {
-                // Not "safe": it looked and marked nothing, which a patch can also arrange.
-                0 => line("The agent flagged nothing. That is not a clearance.".to_owned(), k.c.text_muted),
-                n => line(format!("The agent left {}:", plural(n, "note")), k.c.warning.icon),
-            });
-            for (i, f) in r.findings.iter().enumerate() {
-                let (file, at) = (s.file_of(f), f.line);
-                let path = file.map_or_else(|| format!("file {}", f.file + 1), |pos| s.diff.files()[pos].path().to_owned());
-                let place = if at > 0 { format!("{path}:{at}") } else { path };
-                agent = agent.child(entry(place, &f.why, row().key(format!("note-{i}")).on_press_tx(move |s: &mut State, tx: &mut Tx| {
-                    tx.instant();
-                    let Some(file) = file else { return };
-                    match at {
-                        0 => s.diff.scroll_to_file(file, tx),
-                        at => s.diff.scroll_to_line(file, LineRef::new(Side::New, at), tx),
-                    }
-                })));
-            }
-            if r.dropped > 0 {
-                agent = agent.child(line(format!("It had {} more, past the {} that are kept.", r.dropped, agent::MAX_FINDINGS), k.c.danger.icon));
-            }
-            if !r.complete {
-                agent = agent.child(line("Its reply was cut short or not in the form asked for: there may be more it didn't get to say.".to_owned(), k.c.danger.icon));
-            }
-            if asked.is_some_and(|a| a.waiting) {
-                agent = agent.child(line("Looking again\u{2026}".to_owned(), k.c.text_muted));
-            }
-        }
-    }
-    if let Some(e) = asked.and_then(|a| a.failed.as_ref()) {
-        agent = agent.child(line(format!("The agent didn't answer: {e}"), k.c.danger.icon));
-    }
-    col().key("strip").w_full().max_h(240.0).fill(k.c.layer_01).scroll(ScrollSpec { stick_bottom: false }).child(out.child(agent))
-}
-
-/// The one thing in the window that moves on its own: the mark beside the commit whose
-/// signature is being waited for. It is there to pull the eye to the key, and every frame of
-/// it is the same mark, brighter or dimmer.
-const WAITING: rune::Cycle = rune::Cycle { period: 1.2, phase: 0.0, stops: &[(0.0, 1.0), (0.5, 0.3), (1.0, 1.0)], still: 1.0, fps: 30.0 };
-
-/// The take, in place of the diff: the question, then each signature as it is made.
-fn take_panel(t: &TakeView, k: &Kit) -> El {
-    let n = t.r.commits.len();
-    let line = |txt: String, ink| text(txt).font(k.ty.text_small).color(ink).wrap();
-    let made = t.signed.len();
-    let (title, detail) = match &t.phase {
-        Phase::Confirm(_) => (format!("Take {} as the branch {}?", t.r.short(), t.branch), format!(
-            "{} copied with you as committer and signed with your key, one signature each. The author, message and files of each stay as they are. Nothing is checked out or merged.",
-            if n == 1 { "Its commit is".to_owned() } else { format!("Its {n} commits are") }
-        )),
-        Phase::Running => match &t.signing {
-            Some(_) => (format!("Signature {} of {n}: touch your key", made + 1), "Waiting for the signing program. If your key is blinking, it wants a touch.".to_owned()),
-            None => ("Signing\u{2026}".to_owned(), String::new()),
-        },
-        Phase::Done { tip, count } => (format!("Branch {} created", t.branch), format!(
-            "{} at {}. It is yours to switch to, push or merge: git switch {}",
-            plural(*count, "signed commit"),
-            &tip[..tip.len().min(9)],
-            t.branch
-        )),
-        Phase::Failed(_) => (format!("{} wasn't taken", t.r.short()), "No branch was made.".to_owned()),
-    };
-    let mut panel = col().key("take-panel").w_full().max_w(640.0).gap(10.0).child(text(title).key("take-title").font(k.ty.ui_medium).color(k.c.text_base).wrap());
-    if !detail.is_empty() {
-        panel = panel.child(line(detail, k.c.text_muted));
-    }
-    match &t.phase {
-        Phase::Confirm(Some(why)) => panel = panel.child(line(why.clone(), k.c.danger.icon).key("take-blocked")),
-        Phase::Failed(e) => panel = panel.child(line(e.clone(), k.c.danger.icon).key("take-error")),
-        _ => {}
-    }
-    let mut list = col().w_full().gap(1.0).pt(4.0);
-    for c in &t.r.commits {
-        let waiting = t.signing.as_deref() == Some(&c.sha);
-        let mark = el().size(8.0, 8.0).radius(4.0);
-        let (mark, says) = match t.signed.get(&c.sha) {
-            Some(true) => (mark.fill(k.c.success.icon), "signed earlier"),
-            Some(false) => (mark.fill(k.c.success.icon), "signed"),
-            None if waiting => (mark.fill(k.c.warning.icon).cycle(WAITING), "touch your key"),
-            None => (mark.border(1.0, k.c.text_faint), ""),
-        };
-        let ink = if waiting { k.c.text_base } else { k.c.text_muted };
-        list = list.child(
-            row()
-                .w_full()
-                .px(8.0)
-                .py(4.0)
-                .gap(10.0)
-                .items_center()
-                .radius(6.0)
-                .fill(if waiting { k.c.layer_03 } else { k.c.bg_base })
-                .child(mark)
-                .child(text(c.subject.clone()).font(k.ty.ui).color(ink).truncate().grow(1.0).min_w(0.0))
-                .child(text(says.to_owned()).font(k.ty.text_small).color(if waiting { k.c.warning.icon } else { k.c.text_faint }))
-                .child(text(c.short.clone()).font(k.ty.text_xsmall).color(k.c.text_faint)),
-        );
-    }
-    let hint = match &t.phase {
-        Phase::Confirm(None) => "Enter  sign and create the branch     Esc  back to the diff",
-        Phase::Confirm(Some(_)) => "Esc  back to the diff",
-        Phase::Running => "Esc  stop (signatures already made are kept)",
-        Phase::Done { .. } => "Esc  back to the diff",
-        Phase::Failed(_) => "Enter  try again     Esc  back to the diff",
-    };
-    let panel = panel.child(list).child(text(hint.to_owned()).key("take-hint").font(k.ty.text_xsmall).color(k.c.text_faint));
-    col().key("take").grow(1.0).w_full().min_h(0.0).padding(32.0).items_center().scroll(ScrollSpec { stick_bottom: false }).child(panel)
-}
-
-fn footer(s: &State, k: &Kit) -> El {
-    let line = match &s.notice {
-        Some(n) => text(n.clone()).key("notice").font(k.ty.text_xsmall).color(k.c.danger.icon).truncate(),
-        None => text(KEYS).font(k.ty.text_xsmall).color(k.c.text_faint).truncate(),
-    };
-    row().key("keys").w_full().h(28.0).px(16.0).items_center().fill(k.c.layer_01).child(line)
+fn view(s: &State, _: &mut Cx<State>) -> El {
+    ui::view(s)
 }
 
 /// The Latin letter on the key that typed `t`, for the layouts this is used with: a shortcut
 /// is a place on the keyboard, and `n` on a Russian layout types "т".
 fn shortcut(t: &str) -> &str {
     match t {
-        "т" | "Т" => "n",
-        "з" | "З" => "p",
+        "т" => "n",
+        "з" => "p",
+        "Т" => "N",
+        "З" => "P",
         "ы" | "Ы" => "s",
-        "ц" | "Ц" => "w",
-        "к" | "К" => "r",
+        "ч" | "Ч" => "x",
+        "я" | "Я" => "z",
+        "ь" | "Ь" => "m",
         "г" | "Г" => "u",
         "ф" | "Ф" => "a",
         "е" | "Е" => "t",
@@ -1175,14 +1210,28 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     // click or Tab) has already had its own keys (Space, Return) by the time this runs.
     // `DiffState::key` does stand down while anything is focused, so its four keys are here.
     let m = ev.mods;
-    if s.take.is_some() {
-        // The take has the keyboard until it is closed: no key reaches the diff under it.
+    // A held key acts once where it writes: `x` held would drop ref after ref.
+    let writes = ev.key == Key::Enter || matches!(&ev.key, Key::Text(t) if matches!(shortcut(t), "t" | "x" | "z"));
+    if tx.key_repeat() && (writes || s.keys_open) {
+        return true;
+    }
+    if s.keys_open {
+        // Any key puts the card away; it is only a card.
         tx.instant();
-        match ev.key {
-            Key::Enter => s.start_take(),
-            Key::Escape => s.leave_take(),
-            _ => {}
+        s.keys_open = false;
+        return true;
+    }
+    if s.take.as_ref().is_some_and(|t| t.phase == Phase::Running) {
+        // The signing has the keyboard until it stops: no key reaches the diff under it.
+        tx.instant();
+        if ev.key == Key::Escape {
+            s.pause_take();
         }
+        return true;
+    }
+    if ev.key == Key::Enter && !(m.cmd || m.ctrl || m.alt) && s.selected().is_some_and(|(r, _)| s.branches.contains_key(&r.name)) {
+        tx.instant();
+        s.switch_to();
         return true;
     }
     if let Key::Text(t) = &ev.key
@@ -1192,13 +1241,17 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         match shortcut(t) {
             "n" => s.step(true, tx),
             "p" => s.step(false, tx),
+            "N" => s.step_ref(true, tx),
+            "P" => s.step_ref(false, tx),
             "s" => s.toggle_split(tx),
-            "w" => s.diff.set_wrap(!s.diff.wrap()),
-            "r" => s.toggle_reviewed(),
+            "m" => s.next_note(tx),
             // Again, and from the model itself: a kept answer isn't enough for whoever presses this.
             "a" => s.ask_agent(true),
-            "t" => s.ask_take(),
+            "t" => s.take_now(),
+            "x" => s.drop_ref(),
+            "z" => s.undo_last(),
             "u" => s.reload(),
+            "?" => s.keys_open = true,
             "j" => drop(s.diff.next_hunk(true, tx)),
             "k" => drop(s.diff.next_hunk(false, tx)),
             "]" => drop(s.diff.next_file(true, tx)),
@@ -1290,6 +1343,8 @@ mod tests {
         rt.on_key = Some(on_key);
         rt.poll = Some(poll);
         rt.frame(0.0);
+        // The first frame lays the diff out; the next knows which of its lines are on screen.
+        rt.frame(1.0 / 60.0);
         (rt, dir)
     }
 
@@ -1314,8 +1369,9 @@ mod tests {
     #[test]
     fn a_key_lands_in_one_frame() {
         let (mut rt, dir) = app("one-frame");
-        // Another commit, split, wrap, a mark, back, a hunk, a file: none leaves anything in motion.
-        for t in ["n", "n", "s", "w", "r", "p", "j", "]", "s", "t"] {
+        // Another commit, split, wrap, a note, back, a hunk, a file, the keys card: none leaves
+        // anything in motion.
+        for t in ["n", "n", "s", "m", "p", "j", "]", "s", "?", "?"] {
             assert!(!moves_after(&mut rt, t), "still animating a frame after {t:?}");
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -1348,9 +1404,7 @@ mod tests {
     #[test]
     fn n_and_p_walk_the_rows_and_each_shows_its_own_diff() {
         let (mut rt, dir) = app("walk");
-        type_key(&mut rt, "n");
-        assert_eq!(subject(&rt.state), "all of jail/work");
-        assert_eq!(paths(&rt.state), ["a.txt", "b.txt"]);
+        // n and p walk commits, and pass over a ref's whole change.
         type_key(&mut rt, "n");
         assert_eq!(subject(&rt.state), "first");
         assert_eq!(paths(&rt.state), ["a.txt"]);
@@ -1362,7 +1416,23 @@ mod tests {
         type_key(&mut rt, "p");
         assert_eq!(subject(&rt.state), "first");
         type_key(&mut rt, "з");
-        assert_eq!(subject(&rt.state), "all of jail/work", "p on a Russian layout");
+        assert_eq!(subject(&rt.state), "from the vm", "p on a Russian layout, past the whole change");
+        assert!(rt.state.reviewed.all().iter().all(|m| !m.starts_with("whole:")), "a whole change passed over isn't read");
+        // N and P walk refs: each one's whole change, or its one commit.
+        type_key(&mut rt, "N");
+        assert_eq!(subject(&rt.state), "all of jail/work");
+        assert_eq!(paths(&rt.state), ["a.txt", "b.txt"]);
+        type_key(&mut rt, "N");
+        assert_eq!(subject(&rt.state), "all of jail/work", "N stops at the last ref");
+        type_key(&mut rt, "P");
+        assert_eq!(subject(&rt.state), "from the vm");
+        type_key(&mut rt, "Т");
+        assert_eq!(subject(&rt.state), "all of jail/work", "N on a Russian layout");
+        // From a whole change, n goes into its commits.
+        type_key(&mut rt, "n");
+        assert_eq!(subject(&rt.state), "first");
+        type_key(&mut rt, "P");
+        assert_eq!(subject(&rt.state), "from the vm", "P from a commit is the ref before");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1376,36 +1446,158 @@ mod tests {
     }
 
     #[test]
-    fn the_keys_still_work_after_a_click_on_the_button() {
+    fn the_keys_still_work_after_a_click_on_a_button() {
         let (mut rt, dir) = app("focus");
         press(&mut rt, "item-2");
-        let first = rt.state.selected().unwrap().1.unwrap().sha.clone();
-        press(&mut rt, "mark");
-        assert!(rt.state.reviewed.has(&first), "the button marks the commit");
-        assert_eq!(rt.state.notice, None);
+        press(&mut rt, "split");
+        assert_eq!(rt.state.diff.mode(), DiffMode::Split, "the button splits");
         type_key(&mut rt, "n");
         assert_eq!(subject(&rt.state), "second", "n after the click");
         type_key(&mut rt, "s");
-        assert_eq!(rt.state.diff.mode(), DiffMode::Split, "s after the click");
-        type_key(&mut rt, "r");
-        let second = rt.state.selected().unwrap().1.unwrap().sha.clone();
-        assert!(rt.state.reviewed.has(&second), "r after the click");
+        assert_eq!(rt.state.diff.mode(), DiffMode::Unified, "s after the click");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn saved(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("state/refview/reviewed")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn a_change_is_read_once_every_changed_line_has_been_on_screen() {
+        let (mut rt, dir) = app("seen");
+        // The first commit fits the window: shown is read, with no key pressed.
+        let vm = rt.state.refs[0].commits[0].sha.clone();
+        assert!(rt.state.reviewed.has(&vm));
+        assert_eq!(saved(&dir), std::slice::from_ref(&vm));
+        // A ref's whole change, read, is read as that: its commits were never on screen, and
+        // stay unread. It can be taken, as the one commit that was read.
+        type_key(&mut rt, "N");
+        rt.frame(1.0 / 60.0);
+        let work = rt.state.refs[1].clone();
+        assert_eq!(work.short(), "jail/work");
+        let mut want = vec![vm, take::whole_mark(&work)];
+        want.sort();
+        assert_eq!(saved(&dir), want);
+        assert!(work.commits.iter().all(|c| !rt.state.reviewed.has(&c.sha)));
+        assert_eq!(rt.state.way(&work), Some(Way::One));
+        assert!(rt.state.ready(&work));
+        // Each commit read as well, it is taken commit by commit.
+        type_key(&mut rt, "n");
+        type_key(&mut rt, "n");
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.way(&work), Some(Way::Each));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn r_on_all_changes_marks_and_unmarks_every_commit_of_the_ref() {
-        let (mut rt, dir) = app("all");
+    fn a_change_longer_than_the_window_is_read_only_by_going_through_it() {
+        let (mut rt, dir) = app("long");
+        let repo = dir.join("repo");
+        build(&repo, &["checkout", "-q", "-b", "long", "main"]);
+        let text: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(repo.join("long.txt"), text).unwrap();
+        build(&repo, &["add", "-A"]);
+        build(&repo, &["commit", "-q", "-m", "a long one"]);
+        build(&repo, &["update-ref", "refs/jail/zz-long", "HEAD"]);
+        build(&repo, &["checkout", "-q", "main"]);
+        type_key(&mut rt, "u");
+        let last = rt.state.items.len() - 1;
+        press(&mut rt, &item_key(last));
+        rt.frame(1.0 / 60.0);
+        let sha = rt.state.selected().unwrap().1.unwrap().sha.clone();
+        let (seen, all) = rt.state.diff.read();
+        assert_eq!(all, 400);
+        assert!(seen > 0 && seen < 100, "{seen} of {all} seen with the top on screen");
+        assert!(!rt.state.reviewed.has(&sha) && rt.state.partial.contains(&sha));
+        // Jumping to the end shows the end, not the middle: still not read, and not takeable.
+        let jump = |rt: &mut Runtime<State>, line: u32| {
+            rt.update(|s, tx| s.diff.scroll_to_line(0, LineRef::new(Side::New, line), tx));
+            rt.frame(1.0 / 60.0);
+            rt.frame(1.0 / 60.0);
+        };
+        jump(&mut rt, 400);
+        assert!(!rt.state.reviewed.has(&sha));
+        type_key(&mut rt, "t");
+        assert!(rt.state.take.is_none());
+        assert!(rt.state.notice.as_deref().is_some_and(|n| n.contains("not been on screen")), "{:?}", rt.state.notice);
+        let progress = rt.state.progress(&rt.state.refs.last().unwrap().clone());
+        assert!(progress > 0.0 && progress < 1.0, "{progress}");
+        // Leaving and coming back keeps what was seen.
+        let before = rt.state.diff.read().0;
+        type_key(&mut rt, "p");
         type_key(&mut rt, "n");
-        type_key(&mut rt, "r");
-        let saved = std::fs::read_to_string(dir.join("state/refview/reviewed")).unwrap();
-        let work = &rt.state.refs[1];
-        assert_eq!(work.short(), "jail/work");
-        let mut want: Vec<&str> = work.commits.iter().map(|c| c.sha.as_str()).collect();
-        want.sort();
-        assert_eq!(saved.lines().collect::<Vec<_>>(), want);
-        type_key(&mut rt, "r");
-        assert_eq!(std::fs::read_to_string(dir.join("state/refview/reviewed")).unwrap().trim(), "");
+        assert!(rt.state.diff.read().0 >= before);
+        // Gone through from top to bottom, it is read.
+        for line in (1..=400).step_by(15) {
+            jump(&mut rt, line);
+        }
+        jump(&mut rt, 400);
+        assert_eq!(rt.state.diff.read(), (400, 400));
+        assert!(rt.state.reviewed.has(&sha) && !rt.state.partial.contains(&sha));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_that_wraps_past_the_window_is_read_only_at_its_end() {
+        let (mut rt, dir) = app("tall");
+        let repo = dir.join("repo");
+        build(&repo, &["checkout", "-q", "-b", "tall", "main"]);
+        // No space in it: it must still break at the window's edge, not run on past it.
+        std::fs::write(repo.join("min.js"), format!("first\n{}\nlast\n", "x".repeat(60000))).unwrap();
+        build(&repo, &["add", "-A"]);
+        build(&repo, &["commit", "-q", "-m", "a tall one"]);
+        build(&repo, &["update-ref", "refs/jail/zz-tall", "HEAD"]);
+        build(&repo, &["checkout", "-q", "main"]);
+        type_key(&mut rt, "u");
+        let last = rt.state.items.len() - 1;
+        press(&mut rt, &item_key(last));
+        rt.frame(1.0 / 60.0);
+        let sha = rt.state.selected().unwrap().1.unwrap().sha.clone();
+        // The long line's start is on screen, and its end far below.
+        assert_eq!(rt.state.diff.read(), (1, 3));
+        assert!(!rt.state.reviewed.has(&sha));
+        // A screen further down is still the middle of it.
+        for _ in 0..2 {
+            rt.wheel(700.0, 400.0, -300.0);
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.diff.read(), (1, 3));
+        assert!(!rt.state.reviewed.has(&sha));
+        // Scrolled to where the next line shows under it, it has been gone through.
+        for _ in 0..400 {
+            rt.wheel(700.0, 400.0, -300.0);
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.diff.read(), (3, 3));
+        assert!(rt.state.reviewed.has(&sha));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_hunk_and_file_keys_move_the_mark_in_both_layouts() {
+        let (mut rt, dir) = app("nav");
+        press(&mut rt, "item-1");
+        assert!(paths(&rt.state).len() > 1, "{:?}", paths(&rt.state));
+        let marked = |s: &State| -> Vec<usize> {
+            let rows = s.diff.map().0;
+            (0..rows.len()).filter(|&i| s.diff.in_nav(i)).map(|i| rows[i].file).collect()
+        };
+        assert!(marked(&rt.state).is_empty());
+        // One column first: on, and back.
+        type_key(&mut rt, "j");
+        assert!(marked(&rt.state).first() == Some(&0), "j marks the first file's hunk");
+        type_key(&mut rt, "j");
+        assert!(marked(&rt.state).first() == Some(&1), "j again goes on to the next hunk, though nothing scrolled");
+        type_key(&mut rt, "k");
+        assert!(marked(&rt.state).first() == Some(&0), "k goes back");
+        type_key(&mut rt, "s");
+        assert!(marked(&rt.state).is_empty(), "a new layout starts over");
+        type_key(&mut rt, "j");
+        assert!(marked(&rt.state).first() == Some(&0), "j marks the first file's hunk in two columns");
+        type_key(&mut rt, "]");
+        assert!(marked(&rt.state).first() == Some(&1), "] marks the next file's first hunk");
+        type_key(&mut rt, "[");
+        assert!(marked(&rt.state).first() == Some(&0));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1429,14 +1621,18 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_save_leaves_the_diff_up_and_says_so_in_the_footer() {
+    fn a_failed_save_leaves_the_diff_up_and_says_so() {
         let (mut rt, dir) = app("save");
-        // A directory where the list should be: saving fails.
+        // A directory where the list should be: saving what the next diff's reading marks fails.
+        std::fs::remove_file(dir.join("state/refview/reviewed")).unwrap();
         std::fs::create_dir_all(dir.join("state/refview/reviewed")).unwrap();
-        type_key(&mut rt, "r");
+        type_key(&mut rt, "N");
+        rt.frame(1.0 / 60.0);
+        rt.frame(1.0 / 60.0);
         assert!(rt.state.notice.is_some());
         assert_eq!(rt.state.error, None);
-        assert_eq!(paths(&rt.state), ["c.txt"], "the diff is still shown");
+        assert_eq!(paths(&rt.state), ["a.txt", "b.txt"], "the diff is still shown");
+        assert!(rt.find("notice").is_some(), "and the window says so");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1498,7 +1694,7 @@ mod tests {
         assert_eq!(paths(&rt.state), [".envrc", "build.rs", "tools/gen", "src/lib.rs"]);
         let why: Vec<&str> = rt.state.flags.iter().map(|f| f.unwrap_or("")).collect();
         assert!(why[0].contains("direnv") && why[1].contains("cargo") && why[2].contains("executable") && why[3].is_empty(), "{why:?}");
-        assert!(rt.find("run-1").is_some(), "the strip lists build.rs");
+        assert!(rt.find("file-1").is_some(), "the outline under the commit lists build.rs");
         // The sidebar's count arrives from the worker.
         let sha = rt.state.selected().unwrap().1.unwrap().sha.clone();
         until(&mut rt, "the commit's mark", |s| s.marks.contains_key(&sha));
@@ -1530,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_notes_land_under_their_lines() {
+    fn the_agents_notes_land_on_their_lines() {
         let (mut rt, dir) = app("agent");
         risky(&dir.join("repo"));
         // In the patch: 1 .envrc, 2 build.rs, 3 src/lib.rs, 4 tools/gen.
@@ -1556,19 +1752,23 @@ mod tests {
         assert!(sent.contains("     2 +    println!(\"hi\");"), "the patch goes with its line numbers:\n{sent}");
         // The notes follow their files through the reorder: build.rs is second in the patch
         // and second on screen, src/lib.rs third in the patch and last on screen.
+        // A note on a whole file goes on the file's first line: none is left without a place.
         let at: Vec<(usize, LineRef)> = rt.state.diff.annotations().iter().map(|a| (a.file, a.at)).collect();
-        assert_eq!(at, [(1, LineRef::new(Side::New, 2)), (3, LineRef::new(Side::New, 1))]);
-        assert!(rt.find("note-1").is_some(), "the whole-file note is in the strip");
+        assert_eq!(at, [(1, LineRef::new(Side::New, 2)), (0, LineRef::new(Side::New, 1)), (3, LineRef::new(Side::New, 1))]);
+        assert_eq!(rt.state.file_levels(), [(1, 0), (1, 0), (0, 0), (1, 0)]);
         // Another commit has no notes; coming back, these are still there, and nothing is sent again.
         type_key(&mut rt, "p");
         assert!(rt.state.diff.annotations().is_empty());
         type_key(&mut rt, "n");
-        assert_eq!(rt.state.diff.annotations().len(), 2);
+        assert_eq!(rt.state.diff.annotations().len(), 3);
         assert_eq!(calls(&dir), 1);
-        // The marks didn't move: nothing the agent says reviews a commit.
         let sha = rt.state.selected().unwrap().1.unwrap().sha.clone();
-        assert!(!rt.state.reviewed.has(&sha));
-        assert_eq!(rt.state.noted[&sha], 3);
+        assert_eq!(rt.state.levels[&sha], (3, 0));
+        // m walks the notes and opens the one it lands on.
+        type_key(&mut rt, "m");
+        assert_eq!(rt.state.open_note.as_deref(), Some("0"));
+        type_key(&mut rt, "ь");
+        assert_eq!(rt.state.open_note.as_deref(), Some("1"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1579,15 +1779,21 @@ mod tests {
         rt.state.agent.program = stand_in(&dir, "agent.sh", "FLAG\\t1\\t1\\tFirst look.\\nEND\\n");
         rt.state.auto_agent = true;
         // Shown, so asked: no key needed.
-        type_key(&mut rt, "n");
+        type_key(&mut rt, "N");
         until(&mut rt, "the agent's answer", answered);
-        assert_eq!((calls(&dir), notes(&rt.state).len()), (1, 1));
+        assert_eq!(notes(&rt.state).len(), 1);
+        // With a whole change on screen, each of its commits is asked about too, unopened:
+        // what came and went between them shows on their stops.
+        let work = rt.state.refs[1].clone();
+        until(&mut rt, "the look ahead", |s| work.commits.iter().all(|c| s.levels.contains_key(&c.sha)));
+        assert_eq!(calls(&dir), 3);
+        assert_eq!(rt.state.ref_level(&work), (3, 0));
         // Left and come back to: answered already.
-        type_key(&mut rt, "p");
+        type_key(&mut rt, "P");
         until(&mut rt, "the other diff's answer", answered);
-        type_key(&mut rt, "n");
+        type_key(&mut rt, "N");
         assert!(answered(&rt.state));
-        assert_eq!(calls(&dir), 2);
+        assert_eq!(calls(&dir), 4);
         // A new window: the answer was kept, so the model isn't asked.
         let kept = rt.state.agent.clone();
         let mut again = State::empty(DEFAULT_PATTERNS.iter().map(|&p| p.to_owned()).collect(), Reviewed::at(None), Taken::at(None), true);
@@ -1599,11 +1805,11 @@ mod tests {
         rt2.poll = Some(poll);
         rt2.frame(0.0);
         until(&mut rt2, "the kept answer", answered);
-        assert_eq!(calls(&dir), 2, "a kept answer was asked for again");
+        assert_eq!(calls(&dir), 4, "a kept answer was asked for again");
         // `a` asks the model itself. It now says nothing; the first look's note stays.
         rt.state.agent.program = stand_in(&dir, "agent2.sh", "END\\n");
         type_key(&mut rt, "a");
-        until(&mut rt, "the fresh look", |s| calls(&dir) == 3 && answered(s));
+        until(&mut rt, "the fresh look", |s| calls(&dir) == 5 && answered(s));
         assert_eq!(notes(&rt.state), [(0, 1, "First look.".to_owned())]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1649,7 +1855,36 @@ mod tests {
         // The patch is a bare rename with no mode in it; the mode comes from the tree.
         assert!(!rt.state.patch_text.contains("100755"), "{}", rt.state.patch_text);
         assert_eq!(rt.state.flags, [Some("marked executable")]);
+        // A move has no lines, so its one row is what is read: it says where from.
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.diff.read(), (1, 1));
+        let sha = rt.state.selected().unwrap().1.unwrap().sha.clone();
+        assert!(rt.state.reviewed.has(&sha));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_alarm_marks_its_ref_and_comes_first() {
+        let (mut rt, dir) = app("alarm");
+        std::fs::write(dir.join("go"), "").unwrap();
+        rt.state.agent.program = stand_in(&dir, "agent.sh", "FLAG\\t1\\t1\\tA note.\\nALARM\\t2\\t1\\tSends a key away.\\nEND\\n");
+        type_key(&mut rt, "N");
+        type_key(&mut rt, "a");
+        until(&mut rt, "the agent's answer", answered);
+        let work = rt.state.refs[1].clone();
+        assert_eq!(rt.state.ref_level(&work), (1, 1));
+        assert_eq!(rt.state.file_levels(), [(1, 0), (0, 1)]);
+        assert_eq!(rt.state.line_levels(), HashMap::from([((0, 1), false), ((1, 1), true)]));
+        // The alarm is the first note m goes to, though the model listed it second.
+        type_key(&mut rt, "m");
+        assert_eq!(rt.state.open_note.as_deref(), Some("1"));
+        assert!(rt.state.finding("1").unwrap().alarm);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn enter(rt: &mut Runtime<State>) {
+        rt.key(KeyEvent { key: Key::Enter, mods: Mods::default() });
+        rt.frame(1.0 / 60.0);
     }
 
     #[test]
@@ -1657,49 +1892,161 @@ mod tests {
         let (mut rt, dir) = app("take-ui");
         let repo = dir.join("repo");
         crate::git::testing::signing(&dir, &repo);
-        // On "first" of jail/work, with nothing marked: the take says why not, and Enter does nothing.
+        // On "first" of jail/work, with "second" never opened: the take says why not.
         press(&mut rt, "item-2");
         type_key(&mut rt, "t");
-        let Some(TakeView { phase: Phase::Confirm(Some(why)), .. }) = &rt.state.take else { panic!("no blocked take") };
-        assert!(why.contains("2 of its 2 commits"), "{why}");
-        rt.key(KeyEvent { key: Key::Enter, mods: Mods::default() });
-        rt.frame(1.0 / 60.0);
-        assert!(matches!(rt.state.take.as_ref().unwrap().phase, Phase::Confirm(Some(_))));
-        // While it is up, the diff's keys do nothing, and neither do presses on what is
-        // still drawn around it: another row, the mark, the take itself.
-        type_key(&mut rt, "n");
-        assert_eq!(subject(&rt.state), "first");
-        press(&mut rt, "item-3");
-        assert_eq!(subject(&rt.state), "first");
-        press(&mut rt, "mark");
-        assert!(!rt.state.reviewed.has(&rt.state.selected().unwrap().1.unwrap().sha));
-        press(&mut rt, "take");
-        assert!(matches!(rt.state.take.as_ref().unwrap().phase, Phase::Confirm(Some(_))));
-        rt.key(KeyEvent { key: Key::Escape, mods: Mods::default() });
-        rt.frame(1.0 / 60.0);
         assert!(rt.state.take.is_none());
-        // Mark both, ask again, confirm.
-        type_key(&mut rt, "r");
-        type_key(&mut rt, "n");
-        type_key(&mut rt, "r");
+        assert!(rt.state.notice.as_deref().is_some_and(|n| n.contains("1 of its 2 commits not read")), "{:?}", rt.state.notice);
         press(&mut rt, "take");
-        assert_eq!(rt.state.take.as_ref().unwrap().phase, Phase::Confirm(None));
-        assert_eq!(build(&repo, &["for-each-ref", "refs/heads/reviewed"]), "", "asking makes no branch");
-        rt.key(KeyEvent { key: Key::Enter, mods: Mods::default() });
-        until(&mut rt, "the take", |s| s.take.as_ref().is_some_and(|t| !matches!(t.phase, Phase::Running)));
-        let t = rt.state.take.as_ref().unwrap();
-        let Phase::Done { tip, count } = &t.phase else { panic!("{:?}", t.phase) };
-        assert_eq!(*count, 2);
-        assert_eq!(t.signed.len(), 2);
-        assert_eq!(build(&repo, &["rev-parse", "refs/heads/reviewed/jail/work"]), *tip);
-        assert!(build(&repo, &["cat-file", "commit", "refs/heads/reviewed/jail/work"]).contains("gpgsig "));
-        assert_eq!(build(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert!(rt.state.take.is_none());
+        assert_eq!(build(&repo, &["for-each-ref", "refs/heads/reviewed"]), "", "a refused take makes no branch");
+        // "second" opened and so read: the take goes ahead, with no question first.
+        type_key(&mut rt, "n");
+        press(&mut rt, "take");
+        assert!(rt.state.notice.is_none(), "{:?}", rt.state.notice);
+        assert!(rt.state.take.as_ref().is_some_and(|t| t.phase == Phase::Running));
+        // While signatures are made nothing else moves.
+        type_key(&mut rt, "p");
+        assert_eq!(subject(&rt.state), "second");
+        let taken = |s: &State| s.take.is_none() && s.branches.contains_key("refs/jail/work");
+        until(&mut rt, "the take", taken);
         assert_eq!(rt.state.branches.get("refs/jail/work").map(String::as_str), Some("reviewed/jail/work"));
-        rt.key(KeyEvent { key: Key::Escape, mods: Mods::default() });
-        rt.frame(1.0 / 60.0);
-        // Asked again, it says the ref is taken.
+        let tip = build(&repo, &["rev-parse", "refs/heads/reviewed/jail/work"]);
+        assert!(build(&repo, &["cat-file", "commit", "refs/heads/reviewed/jail/work"]).contains("gpgsig "));
+        assert_eq!(build(&repo, &["rev-list", "--count", "main..refs/heads/reviewed/jail/work"]), "2");
+        // Taking makes the branch and stops: the checkout is where it was.
+        assert_eq!(build(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert!(rt.find("switch").is_some() && rt.find("take").is_none());
+        // A branch someone has moved since is not the take's: neither Enter nor z touches it.
+        build(&repo, &["update-ref", "refs/heads/reviewed/jail/work", "main"]);
+        enter(&mut rt);
+        assert!(rt.state.notice.as_deref().is_some_and(|n| n.contains("no longer where the take left it")), "{:?}", rt.state.notice);
+        assert_eq!(build(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        build(&repo, &["update-ref", "refs/heads/reviewed/jail/work", &tip]);
+        type_key(&mut rt, "u");
+        build(&repo, &["update-ref", "refs/heads/reviewed/jail/work", "main"]);
+        type_key(&mut rt, "z");
+        assert!(rt.state.notice.as_deref().is_some_and(|n| n.contains("Couldn't undo the take")), "{:?}", rt.state.notice);
+        assert_eq!(build(&repo, &["rev-parse", "refs/heads/reviewed/jail/work"]), build(&repo, &["rev-parse", "main"]));
+        build(&repo, &["update-ref", "refs/heads/reviewed/jail/work", &tip]);
+        type_key(&mut rt, "u");
+        // Nor one another working tree has checked out.
+        let other = dir.join("other");
+        build(&repo, &["worktree", "add", "-q", other.to_str().unwrap(), "reviewed/jail/work"]);
+        type_key(&mut rt, "z");
+        assert!(rt.state.notice.as_deref().is_some_and(|n| n.contains("is checked out in")), "{:?}", rt.state.notice);
+        build(&repo, &["worktree", "remove", "--force", other.to_str().unwrap()]);
+        // z takes the take back: the branch goes, the signed copies stay.
+        type_key(&mut rt, "я");
+        assert!(rt.state.branches.is_empty());
+        assert_eq!(build(&repo, &["for-each-ref", "refs/heads/reviewed"]), "");
+        // Taken again, the same copies are used: the branch is where it was.
         type_key(&mut rt, "t");
-        assert!(matches!(&rt.state.take.as_ref().unwrap().phase, Phase::Confirm(Some(why)) if why.contains("Already taken")));
+        until(&mut rt, "the second take", taken);
+        assert_eq!(build(&repo, &["rev-parse", "refs/heads/reviewed/jail/work"]), tip);
+        // Enter switches to it, and only then.
+        enter(&mut rt);
+        assert_eq!(rt.state.notice, None);
+        assert_eq!(build(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/reviewed/jail/work");
+        assert_eq!(rt.state.head.as_deref(), Some("reviewed/jail/work"));
+        // The branch the checkout is on isn't deleted from under it.
+        press(&mut rt, "item-3");
+        type_key(&mut rt, "z");
+        assert!(rt.state.notice.as_deref().is_some_and(|n| n.contains("You are on")));
+        assert_eq!(build(&repo, &["rev-parse", "refs/heads/reviewed/jail/work"]), tip);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_whole_change_read_is_taken_as_one_commit() {
+        let (mut rt, dir) = app("take-one-ui");
+        let repo = dir.join("repo");
+        crate::git::testing::signing(&dir, &repo);
+        // The ref's own row: its whole change, which fits the window and so is read.
+        press(&mut rt, "item-1");
+        rt.frame(1.0 / 60.0);
+        let work = rt.state.refs[1].clone();
+        assert_eq!(rt.state.way(&work), Some(Way::One));
+        press(&mut rt, "take");
+        let taken = |s: &State| s.take.is_none() && s.branches.contains_key("refs/jail/work");
+        until(&mut rt, "the take", taken);
+        // One signed commit on main with the ref's files; its own commits are not in it.
+        assert_eq!(build(&repo, &["rev-list", "--count", "main..refs/heads/reviewed/jail/work"]), "1");
+        assert_eq!(build(&repo, &["rev-parse", "refs/heads/reviewed/jail/work^{tree}"]), build(&repo, &["rev-parse", "refs/jail/work^{tree}"]));
+        assert!(build(&repo, &["cat-file", "commit", "refs/heads/reviewed/jail/work"]).contains("gpgsig "));
+        assert!(rt.state.took_one.contains("refs/jail/work"));
+        assert!(work.commits.iter().all(|c| !rt.state.reviewed.has(&c.sha)), "the commits were not read, and are not marked so");
+        // z takes it back like any take.
+        type_key(&mut rt, "z");
+        assert!(rt.state.branches.is_empty(), "{:?}", rt.state.notice);
+        assert_eq!(build(&repo, &["for-each-ref", "refs/heads/reviewed"]), "");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_commit_is_read_once_its_page_is_drawn() {
+        let (mut rt, dir) = app("empty");
+        let repo = dir.join("repo");
+        build(&repo, &["checkout", "-q", "-b", "e", "main"]);
+        build(&repo, &["commit", "-q", "--allow-empty", "-m", "nothing"]);
+        build(&repo, &["update-ref", "refs/jail/zz-empty", "HEAD"]);
+        build(&repo, &["checkout", "-q", "main"]);
+        type_key(&mut rt, "u");
+        let last = rt.state.items.len() - 1;
+        let sha = rt.state.refs.last().unwrap().commits[0].sha.clone();
+        // Selected and landed, but not yet drawn: not read.
+        rt.update(|s, tx| s.select(last, tx));
+        assert!(!rt.state.loading && rt.state.diff.files().is_empty());
+        assert!(!rt.state.reviewed.has(&sha));
+        // Drawn, and asked after (by the next poll, or by Take itself): read.
+        rt.frame(1.0 / 60.0);
+        rt.update(|s, _| s.take_now());
+        assert!(rt.state.reviewed.has(&sha));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_ref_is_struck_out_until_it_is_put_back() {
+        let (mut rt, dir) = app("drop");
+        let repo = dir.join("repo");
+        let was = build(&repo, &["rev-parse", "refs/devvm/one"]);
+        // On "from the vm": x drops its ref.
+        type_key(&mut rt, "ч");
+        assert_eq!(build(&repo, &["for-each-ref", "refs/devvm"]), "");
+        assert_eq!(rt.state.items.len(), 3);
+        assert_eq!(rt.state.dropped.len(), 1);
+        assert!(rt.find("undrop-devvm/one").is_some(), "it is still drawn, struck out");
+        assert_eq!(subject(&rt.state), "all of jail/work");
+        // z puts it back where it was.
+        type_key(&mut rt, "z");
+        assert_eq!(build(&repo, &["rev-parse", "refs/devvm/one"]), was);
+        assert!(rt.state.dropped.is_empty());
+        assert_eq!(rt.state.items.len(), 4);
+        // Dropped again, the button on its struck row does the same.
+        press(&mut rt, "item-0");
+        press(&mut rt, "drop");
+        assert_eq!(rt.state.dropped.len(), 1);
+        press(&mut rt, "undrop-devvm/one");
+        assert_eq!(build(&repo, &["rev-parse", "refs/devvm/one"]), was);
+        // Dropped, made again elsewhere, dropped again: z puts back the last one dropped.
+        press(&mut rt, "item-0");
+        type_key(&mut rt, "x");
+        let work = build(&repo, &["rev-parse", "refs/jail/work"]);
+        build(&repo, &["update-ref", "refs/devvm/one", &work]);
+        type_key(&mut rt, "u");
+        press(&mut rt, "item-0");
+        assert!(rt.state.selected().is_some_and(|(r, _)| r.name == "refs/devvm/one" && r.tip == work));
+        type_key(&mut rt, "x");
+        assert_eq!(rt.state.dropped.len(), 2);
+        type_key(&mut rt, "z");
+        assert_eq!(build(&repo, &["rev-parse", "refs/devvm/one"]), work);
+        assert_eq!(rt.state.dropped.len(), 1);
+        // A ref that names another ref is left alone: it could only come back as a plain one.
+        build(&repo, &["symbolic-ref", "refs/jail/alias", "refs/jail/work"]);
+        let git = Repo::open(&repo).unwrap();
+        assert!(git.delete_ref("refs/jail/alias", &work).is_err());
+        assert_eq!(build(&repo, &["symbolic-ref", "refs/jail/alias"]), "refs/jail/work");
+        assert!(git.delete_ref("refs/jail/w\u{fffd}rk", &work).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1719,11 +2066,11 @@ mod tests {
         assert_eq!(rt.state.error, None);
         assert_eq!(paths(&rt.state), [".envrc"]);
         assert!(rt.state.flags[0].is_some());
-        // Nothing to mark or take: both say so and change nothing.
-        type_key(&mut rt, "r");
-        assert!(rt.state.notice.as_deref().is_some_and(|n| n.contains("jail apply")));
+        // Nothing to take or drop: the strip says what to do instead, and the keys change nothing.
         type_key(&mut rt, "t");
-        assert!(rt.state.take.is_none());
+        type_key(&mut rt, "x");
+        assert!(rt.state.take.is_none() && rt.state.dropped.is_empty());
+        assert!(rt.find("take").is_none() && rt.find("drop").is_none());
         // A jail that fails is an error on screen, not an empty diff.
         let state = State::snapshot_with(&dir, true, Some(script(&dir, "nojail.sh", "echo 'jail: no snapshot of this folder' >&2\nexit 1\n")), false);
         assert!(state.error.as_deref().is_some_and(|e| e.contains("no snapshot")), "{:?}", state.error);

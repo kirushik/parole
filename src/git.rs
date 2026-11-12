@@ -2,11 +2,17 @@
 //! (without `-w`), `for-each-ref`, `merge-base`, `log`, `show`, `diff`, `rev-list`, `cat-file`,
 //! `check-ref-format` and `symbolic-ref` (to read). Nothing is checked out, merged or built.
 //!
-//! Taking a ref (the last section of [`Repo`]) is the one thing that writes, and only on the
-//! reader's say: `commit-tree -S` makes signed copies of the ref's commits from their existing
-//! trees, and `update-ref` creates one new branch at the last of them. No working tree, index
-//! or existing ref is touched, and no hook of the commit kind runs: nothing is committed the
-//! porcelain way.
+//! Four things write (the last section of [`Repo`]), each only on the reader's own press:
+//!
+//! - Taking a ref: `commit-tree -S` makes signed copies of the ref's commits from their
+//!   existing trees, and `update-ref` creates one new branch at the last of them. No working
+//!   tree, index or existing ref is touched, and no hook of the commit kind runs.
+//! - Undoing a take: `update-ref -d` deletes that branch, if it is still where the take left
+//!   it and no working tree has it checked out.
+//! - Dropping a ref and putting it back: `update-ref -d` on the ref if it still points where
+//!   it was listed, and `update-ref` to recreate it if nothing is there by then.
+//! - Switching to a taken branch: `git switch`, which changes the working tree and runs the
+//!   checkout's own `post-checkout` hook, as switching by hand would.
 //!
 //! What a reviewed ref controls (file contents, paths, commit messages, author names, its own
 //! `.gitattributes`) must not be able to make git run a program or write a file. So:
@@ -235,6 +241,10 @@ impl Repo {
         "--src-prefix=a/",
         "--dst-prefix=b/",
         "--no-color",
+        "--no-relative",
+        "--output-indicator-new=+",
+        "--output-indicator-old=-",
+        "--output-indicator-context= ",
         "-M",
     ];
 
@@ -349,6 +359,31 @@ impl Repo {
         Ok(new)
     }
 
+    /// A new signed commit of `tree` on `parents` saying `message`, by `author` (name, email,
+    /// date) or, without one, by whoever git's config says the reader is. Returns its hash.
+    pub fn sign_tree(&self, tree: &str, parents: &[String], message: &str, author: Option<(&str, &str, &str)>, cancel: &AtomicBool) -> Result<String, String> {
+        let mut args = vec!["commit-tree", "-S"];
+        for p in parents {
+            args.extend(["-p", object_id(p)?]);
+        }
+        args.push(object_id(tree)?);
+        let env: Vec<(&str, &str)> = author.map_or(Vec::new(), |(name, email, date)| vec![("GIT_AUTHOR_NAME", name), ("GIT_AUTHOR_EMAIL", email), ("GIT_AUTHOR_DATE", date)]);
+        let call = Call { stdin: Some(message.as_bytes()), env: &env, unset: &["CLAUDECODE"], cancel: Some(cancel) };
+        let (code, out, err) = run_bytes(&self.dir, &args, &call)?;
+        if code != Some(0) {
+            return Err(format!("not signed: {}", err.trim()));
+        }
+        let new = object_id(String::from_utf8_lossy(&out).trim())?.to_owned();
+        let made = self.raw_commit(&new)?;
+        if !made.signed {
+            return Err("git made the commit without a signature".to_owned());
+        }
+        if made.tree != tree || made.parents != parents || made.message != message {
+            return Err("git's signed commit isn't the one asked for; it isn't used".to_owned());
+        }
+        Ok(new)
+    }
+
     /// The commit a local branch points at, or `None` when there is no such branch.
     pub fn branch_tip(&self, branch: &str) -> Result<Option<String>, String> {
         let name = self.branch_ref(branch)?;
@@ -383,6 +418,65 @@ impl Repo {
         let absent = "0".repeat(tip.len());
         let reason = format!("refview: take {from}");
         self.git(&["update-ref", "--no-deref", "-m", &reason, "--end-of-options", &name, tip, &absent])?.ok("update-ref").map(drop)
+    }
+
+    /// Deletes the ref `name` (a full name, `refs/…`) if it still points at `tip`. Its commits
+    /// stay in the repository until git prunes them, so [`Repo::restore_ref`] can undo it.
+    pub fn delete_ref(&self, name: &str, tip: &str) -> Result<(), String> {
+        let tip = object_id(tip)?;
+        self.plain_ref(name)?;
+        self.git(&["update-ref", "--no-deref", "-d", "-m", "refview: drop", "--end-of-options", name, tip])?.ok("update-ref").map(drop)
+    }
+
+    /// Puts the ref `name` back at `tip`, unless something is there by now.
+    pub fn restore_ref(&self, name: &str, tip: &str) -> Result<(), String> {
+        let tip = object_id(tip)?;
+        self.plain_ref(name)?;
+        let absent = "0".repeat(tip.len());
+        self.git(&["update-ref", "--no-deref", "-m", "refview: undo drop", "--end-of-options", name, tip, &absent])?.ok("update-ref").map(drop)
+    }
+
+    /// A full ref name this may delete or put back: one git accepts, that reached us whole,
+    /// and that is a ref of its own. A name that wasn't UTF-8 was read with stand-in
+    /// characters, and would name another ref; a symbolic ref would come back as a plain one.
+    fn plain_ref(&self, name: &str) -> Result<(), String> {
+        if !name.starts_with("refs/") || name.contains('\u{fffd}') || self.git(&["check-ref-format", name])?.code != Some(0) {
+            return Err(format!("{name:?} isn't a ref name this can act on"));
+        }
+        // Exit 1 is "not a symbolic ref".
+        if self.git(&["symbolic-ref", "--quiet", "--end-of-options", name])?.code != Some(1) {
+            return Err(format!("{name} is a symbolic ref; it is left alone"));
+        }
+        Ok(())
+    }
+
+    /// Deletes the local branch `branch` if it still points at `tip` and no working tree has
+    /// it checked out.
+    pub fn delete_branch(&self, branch: &str, tip: &str) -> Result<(), String> {
+        let name = self.branch_ref(branch)?;
+        // git fills `worktreepath` for a branch that is some working tree's HEAD.
+        let held = self.git(&["for-each-ref", "--format=%(worktreepath)", "--", &name])?.ok("for-each-ref")?;
+        if let Some(path) = held.lines().find(|l| !l.is_empty()) {
+            return Err(format!("{branch} is checked out in {path}; switch away from it first"));
+        }
+        self.delete_ref(&name, tip)
+    }
+
+    /// The local branch HEAD is on, or `None` when it is detached.
+    pub fn head_branch(&self) -> Option<String> {
+        let out = self.git(&["symbolic-ref", "--quiet", "--short", "HEAD"]).ok()?;
+        (out.code == Some(0)).then(|| out.stdout.trim().to_owned()).filter(|b| !b.is_empty())
+    }
+
+    /// `git switch BRANCH`: changes the working tree, which runs the checkout's own hooks.
+    /// Only ever asked for by the reader, on a branch they have taken.
+    pub fn switch(&self, branch: &str) -> Result<(), String> {
+        self.branch_ref(branch)?;
+        let out = self.git(&["switch", "--no-guess", "--end-of-options", branch])?;
+        match out.code {
+            Some(0) => Ok(()),
+            _ => Err(out.stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("git switch failed").trim().to_owned()),
+        }
     }
 }
 
@@ -525,6 +619,8 @@ fn run_bytes(dir: &Path, args: &[&str], call: &Call) -> Result<(Option<i32>, Vec
         // object a partial clone lacks (that runs transports and helpers), and show each
         // object as itself, not as what refs/replace/ maps it to.
         .args(["--no-optional-locks", "--no-pager", "--no-replace-objects"])
+        // A blank context line keeps its leading space, so every hunk line parses as one.
+        .args(["-c", "diff.suppressBlankEmpty=false"])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
@@ -752,6 +848,10 @@ mod tests {
             ("diff.evil.textconv", tool),
             ("diff.evil.command", tool),
             ("diff.noprefix", "true"),
+            ("diff.relative", "true"),
+            ("diff.outputIndicatorNew", "X"),
+            ("diff.outputIndicatorOld", "Y"),
+            ("diff.suppressBlankEmpty", "true"),
             ("diff.submodule", "diff"),
             ("log.showRoot", "false"),
             ("log.showSignature", "true"),

@@ -10,6 +10,11 @@
 //! The gate is inside [`run`], on the list read at that moment, not on what the window showed:
 //! a commit that isn't marked read stops the take before anything is signed.
 //!
+//! A ref read as one change (its whole diff, not commit by commit) is taken as one commit
+//! instead ([`Way::One`]): the ref's final files on the commit where it left HEAD, signed. The
+//! commits in between were not read, so they are not copied: nothing of them reaches the
+//! branch, and no later `git bisect` can land on one. You get what you read.
+//!
 //! Each signature may need a touch of a hardware key. Copies already made are remembered
 //! (`$XDG_STATE_HOME/refview/taken`, `OLD NEW` a line), so a take that stops halfway picks up
 //! where it stopped instead of asking for every touch again.
@@ -34,7 +39,42 @@ pub enum Step {
     Failed(String),
 }
 
-/// The copies made so far, by the hash of the commit each one copies.
+/// How a ref is taken: what was read decides.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Way {
+    /// Every commit was read: each is copied, and the history kept.
+    Each,
+    /// The whole change was read as one diff: one commit holds it.
+    One,
+}
+
+/// What a ref's whole change is marked read under, and its one-commit copy remembered under:
+/// where it left HEAD and the commit it named. The diff between those two is what was read.
+pub fn whole_mark(r: &RefInfo) -> String {
+    format!("whole:{}:{}", r.base.as_deref().unwrap_or("root"), r.tip)
+}
+
+/// What a ref's one-commit copy is remembered under: the change, and the ref it was taken
+/// from. Two refs at the same commit are two takes, each with its own branch and message.
+pub fn one_key(r: &RefInfo) -> String {
+    format!("{}:{}", whole_mark(r), r.name)
+}
+
+fn is_one_key(s: &str) -> bool {
+    let mut parts = s.splitn(4, ':');
+    parts.next() == Some("whole")
+        && parts.next().is_some_and(|b| b == "root" || crate::git::is_object_id(b))
+        && parts.next().is_some_and(crate::git::is_object_id)
+        && parts.next().is_some_and(|name| name.starts_with("refs/") && !name.contains(char::is_whitespace))
+}
+
+/// The line a one-commit take's message ends with: which ref it was, and at which commit.
+fn one_source(r: &RefInfo) -> String {
+    format!("Read as one change with refview, from {} at {}.\n", r.name, r.tip)
+}
+
+/// The copies made so far, by the hash of the commit each one copies, or by the
+/// [`whole_mark`] of a change taken as one.
 #[derive(Default)]
 pub struct Taken {
     map: BTreeMap<String, String>,
@@ -51,7 +91,7 @@ impl Taken {
         let map = text
             .lines()
             .filter_map(|l| l.split_once(' '))
-            .filter(|(old, new)| crate::git::is_object_id(old) && crate::git::is_object_id(new))
+            .filter(|(old, new)| (crate::git::is_object_id(old) || is_one_key(old)) && crate::git::is_object_id(new))
             .map(|(old, new)| (old.to_owned(), new.to_owned()))
             .collect();
         Taken { map, path }
@@ -81,24 +121,102 @@ pub fn branch_for(r: &RefInfo) -> String {
     format!("reviewed/{}", r.short())
 }
 
-/// Whether a ref has been taken: `copy`, the remembered copy of its tip, is a signed commit
-/// other than the tip with the tip's files, and the branch points at it. The list of copies
-/// is only a hint; what is claimed is checked in the repository.
-pub fn taken_as(repo: &Repo, copy: &str, r: &RefInfo) -> Option<String> {
+/// Whether a ref has been taken, and how: `copy`, a remembered copy, is a signed commit other
+/// than the tip with the tip's files, and the branch points at it. For [`Way::Each`] it is the
+/// tip's own copy (its message and author); for [`Way::One`] it sits on where the ref left
+/// HEAD. The list of copies is only a hint; what is claimed is checked in the repository.
+pub fn taken_as(repo: &Repo, copy: &str, way: Way, r: &RefInfo) -> Option<String> {
     let branch = branch_for(r);
     if copy == r.tip || repo.branch_tip(&branch).ok()?.as_deref() != Some(copy) {
         return None;
     }
     let (made, original) = (repo.raw_commit(copy).ok()?, repo.raw_commit(&r.tip).ok()?);
-    (made.signed && made.tree == original.tree && made.message == original.message && made.author == original.author).then_some(branch)
+    let same = match way {
+        Way::Each => made.message == original.message && made.author == original.author,
+        // Its message is this ref's: another commit with the same files isn't this take.
+        Way::One => made.parents.as_slice() == r.base.as_slice() && made.message.starts_with(&format!("Take {}: ", r.short())) && made.message.ends_with(&one_source(r)),
+    };
+    (made.signed && made.tree == original.tree && same).then_some(branch)
 }
 
-/// Takes `r` as `branch`, reporting each step. `reviewed` is every hash marked read. `taken`
+/// Takes `r` as `branch`, reporting each step. `reviewed` is everything marked read. `taken`
 /// is locked only to look a copy up or note one, never across a signature.
-pub fn run(repo: &Repo, r: &RefInfo, branch: &str, reviewed: &BTreeSet<String>, taken: &Mutex<Taken>, cancel: &AtomicBool, report: &mut dyn FnMut(Step)) {
-    if let Err(e) = copy(repo, r, branch, reviewed, taken, cancel, report) {
+#[allow(clippy::too_many_arguments)]
+pub fn run(repo: &Repo, r: &RefInfo, branch: &str, way: Way, reviewed: &BTreeSet<String>, taken: &Mutex<Taken>, cancel: &AtomicBool, report: &mut dyn FnMut(Step)) {
+    let done = match way {
+        Way::Each => copy(repo, r, branch, reviewed, taken, cancel, report),
+        Way::One => squash(repo, r, branch, reviewed, taken, cancel, report),
+    };
+    if let Err(e) = done {
         report(Step::Failed(e));
     }
+}
+
+/// What the one commit says: the ref, the subjects of the commits it stands for, and the
+/// commit it was made from. The subjects are the sandbox's words, kept as a list.
+fn one_message(r: &RefInfo, subjects: &[String]) -> String {
+    let mut m = format!("Take {}: {} as one\n\n", r.short(), if subjects.len() == 1 { "1 commit".to_owned() } else { format!("{} commits", subjects.len()) });
+    for s in subjects {
+        m.push_str(&format!("- {s}\n"));
+    }
+    m.push('\n');
+    m.push_str(&one_source(r));
+    m
+}
+
+/// One signed commit with the ref's files, on the commit where the ref left HEAD's history.
+fn squash(repo: &Repo, r: &RefInfo, branch: &str, reviewed: &BTreeSet<String>, taken: &Mutex<Taken>, cancel: &AtomicBool, report: &mut dyn FnMut(Step)) -> Result<(), String> {
+    if let Some(e) = &r.error {
+        return Err(format!("this ref couldn't be read: {e}"));
+    }
+    let (mark, key) = (whole_mark(r), one_key(r));
+    if !reviewed.contains(&mark) {
+        return Err("this ref's whole change isn't marked read".to_owned());
+    }
+    let list = repo.take_list(r)?;
+    if list.is_empty() {
+        return Err("HEAD already has everything on this ref".to_owned());
+    }
+    if repo.branch_tip(branch)?.is_some() {
+        return Err(format!("there is already a branch {branch}; rename or delete it first"));
+    }
+    let originals: Vec<_> = list.iter().map(|sha| repo.raw_commit(sha)).collect::<Result<_, _>>()?;
+    let tip = repo.raw_commit(&r.tip)?;
+    let subjects: Vec<String> = originals.iter().map(|c| c.message.lines().next().unwrap_or("").to_owned()).collect();
+    let message = one_message(r, &subjects);
+    // Written by one hand, it keeps that author; by several, or by one git wouldn't write
+    // down as given (no name, no email), it is the reader's commit.
+    let one_author = originals.iter().all(|c| c.author_name == tip.author_name && c.author_email == tip.author_email) && !tip.author_name.trim().is_empty() && !tip.author_email.trim().is_empty();
+    let author = one_author.then_some((tip.author_name.as_str(), tip.author_email.as_str(), tip.author_date.as_str()));
+    let by = |c: &crate::git::RawCommit| author.is_none_or(|(name, email, _)| c.author_name == name && c.author_email == email);
+    let parents: Vec<String> = r.base.iter().cloned().collect();
+    let before = taken.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(str::to_owned);
+    let kept = before.filter(|new| repo.raw_commit(new).is_ok_and(|c| c.signed && c.tree == tip.tree && c.parents == parents && c.message == message && by(&c)));
+    let new = match kept {
+        Some(new) => {
+            report(Step::Signed { sha: r.tip.clone(), reused: true });
+            new
+        }
+        None => {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(crate::git::CANCELLED.to_owned());
+            }
+            report(Step::Signing { i: 0, n: 1, sha: r.tip.clone() });
+            let new = repo.sign_tree(&tip.tree, &parents, &message, author, cancel)?;
+            if !repo.raw_commit(&new).is_ok_and(|c| by(&c)) {
+                return Err("git wrote the commit's author down changed; it isn't used".to_owned());
+            }
+            taken.lock().unwrap_or_else(|e| e.into_inner()).record(&key, &new);
+            report(Step::Signed { sha: r.tip.clone(), reused: false });
+            new
+        }
+    };
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::git::CANCELLED.to_owned());
+    }
+    repo.create_branch(branch, &new, &r.name)?;
+    report(Step::Done { branch: branch.to_owned(), tip: new, count: 1 });
+    Ok(())
 }
 
 fn copy(repo: &Repo, r: &RefInfo, branch: &str, reviewed: &BTreeSet<String>, taken: &Mutex<Taken>, cancel: &AtomicBool, report: &mut dyn FnMut(Step)) -> Result<(), String> {
@@ -195,8 +313,50 @@ mod tests {
     fn take(repo: &Repo, r: &RefInfo, reviewed: &[&str], taken: &Mutex<Taken>) -> Vec<Step> {
         let mut steps = Vec::new();
         let reviewed = reviewed.iter().map(|&s| s.to_owned()).collect();
-        run(repo, r, &branch_for(r), &reviewed, taken, &AtomicBool::new(false), &mut |s| steps.push(s));
+        run(repo, r, &branch_for(r), Way::Each, &reviewed, taken, &AtomicBool::new(false), &mut |s| steps.push(s));
         steps
+    }
+
+    #[test]
+    fn a_ref_read_as_one_change_becomes_one_signed_commit() {
+        let dir = scratch("take-one");
+        let (repo, r) = repo(&dir);
+        let work = dir.join("repo");
+        let taken = Mutex::new(Taken::at(Some(dir.join("taken"))));
+        let one = |reviewed: &[String]| {
+            let mut steps = Vec::new();
+            let reviewed = reviewed.iter().cloned().collect();
+            run(&repo, &r, &branch_for(&r), Way::One, &reviewed, &taken, &AtomicBool::new(false), &mut |s| steps.push(s));
+            steps
+        };
+        // Its commits read, but not its whole change: that is the other way to take it.
+        let commits: Vec<String> = r.commits.iter().map(|c| c.sha.clone()).collect();
+        assert!(matches!(one(&commits).last(), Some(Step::Failed(e)) if e.contains("whole change isn't marked read")));
+        assert_eq!(build(&work, &["for-each-ref", "refs/heads/reviewed"]), "");
+        let steps = one(&[whole_mark(&r)]);
+        let Some(Step::Done { tip, count: 1, .. }) = steps.last() else { panic!("not done: {steps:?}") };
+        let made = repo.raw_commit(tip).unwrap();
+        // The ref's files, on main, signed, and nothing of the commits in between.
+        assert_eq!(made.tree, repo.raw_commit(&r.tip).unwrap().tree);
+        assert_eq!(made.parents, [build(&work, &["rev-parse", "main"])]);
+        assert!(made.signed);
+        assert_eq!(build(&work, &["rev-list", "--count", "main..refs/heads/reviewed/jail/work"]), "1");
+        for sha in &commits {
+            let within = std::process::Command::new("git").arg("-C").arg(&work).args(["merge-base", "--is-ancestor", sha, "refs/heads/reviewed/jail/work"]).status().unwrap();
+            assert!(!within.success(), "{sha} is in the taken branch's history");
+        }
+        // One hand wrote it all, so it keeps that author; the message lists what it stands for.
+        assert_eq!(made.author_name, "agent");
+        assert!(made.message.starts_with("Take jail/work: 2 commits as one\n\n- first\n- second\n"), "{}", made.message);
+        assert!(made.message.contains(&r.tip));
+        assert_eq!(taken_as(&repo, tip, Way::One, &r).as_deref(), Some("reviewed/jail/work"));
+        assert_eq!(taken_as(&repo, tip, Way::Each, &r), None);
+        // Undone and taken again, the same commit is used: no second signature.
+        build(&work, &["update-ref", "-d", "refs/heads/reviewed/jail/work"]);
+        let again = one(&[whole_mark(&r)]);
+        assert!(again.contains(&Step::Signed { sha: r.tip.clone(), reused: true }), "{again:?}");
+        assert!(matches!(again.last(), Some(Step::Done { tip: t, .. }) if t == tip));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -229,11 +389,11 @@ mod tests {
         assert_eq!(build(&work, &["status", "--porcelain"]), "");
         assert_eq!(build(&work, &["symbolic-ref", "HEAD"]), "refs/heads/main");
         let copy = taken.lock().unwrap().get(&r.tip).unwrap().to_owned();
-        assert_eq!(taken_as(&repo, &copy, &r).as_deref(), Some("reviewed/jail/work"));
+        assert_eq!(taken_as(&repo, &copy, Way::Each, &r).as_deref(), Some("reviewed/jail/work"));
         // The claim rests on the repository, not on the list: the tip itself, or some other
         // commit, is not a copy.
-        assert_eq!(taken_as(&repo, &r.tip, &r), None);
-        assert_eq!(taken_as(&repo, &build(&work, &["rev-parse", "main"]), &r), None);
+        assert_eq!(taken_as(&repo, &r.tip, Way::Each, &r), None);
+        assert_eq!(taken_as(&repo, &build(&work, &["rev-parse", "main"]), Way::Each, &r), None);
         // A second take doesn't move the branch.
         let again = take(&repo, &r, &shas, &taken);
         assert!(matches!(again.last(), Some(Step::Failed(e)) if e.contains("already a branch")), "{again:?}");
@@ -269,7 +429,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let reviewed: BTreeSet<String> = shas.iter().map(|&s| s.to_owned()).collect();
         let mut signed = 0;
-        run(&repo, &r, "reviewed/jail/work", &reviewed, &taken, &cancel, &mut |s| {
+        run(&repo, &r, "reviewed/jail/work", Way::Each, &reviewed, &taken, &cancel, &mut |s| {
             if matches!(s, Step::Signed { .. }) {
                 signed += 1;
                 // Stop after the first copy.
@@ -375,7 +535,7 @@ mod tests {
         let reviewed: BTreeSet<String> = r.commits.iter().map(|c| c.sha.clone()).collect();
         let cancel = AtomicBool::new(false);
         let (mut signed, mut last) = (0, None);
-        run(&repo, &r, "reviewed/jail/work", &reviewed, &Mutex::new(Taken::at(None)), &cancel, &mut |s| {
+        run(&repo, &r, "reviewed/jail/work", Way::Each, &reviewed, &Mutex::new(Taken::at(None)), &cancel, &mut |s| {
             if matches!(s, Step::Signed { .. }) {
                 signed += 1;
                 cancel.store(signed == 2, std::sync::atomic::Ordering::Relaxed);

@@ -28,10 +28,10 @@ reviewed="$tmp/state/refview/reviewed"
 
 fail() { echo "check.sh: $*" >&2; exit 1; }
 
-# Each run starts with nothing reviewed, so a script's `r` always marks. Rune's own progress
+# Each run starts with nothing read, unless KEEP_STATE says to go on from the last one. Rune's own progress
 # lines are dropped; the app's exit status is kept.
 run() {
-    rm -rf -- "$tmp/state"
+    [ -n "${KEEP_STATE:-}" ] || rm -rf -- "$tmp/state"
     local log="$tmp/log"
     "$bin" "$@" > "$log" 2>&1 || { cat "$log" >&2; fail "refview $* failed"; }
     grep -v '^rune' "$log" || true
@@ -41,61 +41,71 @@ sha() { git -C "$fixture" rev-parse "$1"; }
 # The tree prints a header field as `"key": "title"` ... `"text": "..."`; one grep per claim.
 has() { grep -qF -- "$2" "$1" || fail "$1: expected $2"; }
 lacks() { ! grep -qF -- "$2" "$1" || fail "$1: did not expect $2"; }
+# What the header says is shown: a subject is in the sidebar too, whatever is selected.
+title_is() { grep -F -A1 -- '"key": "title",' "$1" | grep -qF -- "\"name\": \"$2\"" || fail "$1: the header's title isn't $2"; }
+# Two columns have a rule between them; one column has none.
+split() { has "$1" '"key": "divider"'; }
 
 run "$fixture" --snap out/first.png --theme dark
 run "$fixture" --tree out/first.json
-has out/first.json 'Document the retry limit'
-has out/first.json '"1 file"'
+title_is out/first.json 'Document the retry limit'
+lacks out/first.json '"key": "divider"'
+has out/first.json 'reviewed/devvm/run-0042'
 
-# n, n, r, s: onto the first commit of jail/retry-jitter, marked, split.
+read_() { grep -qxF -- "$(sha "$1")" "$reviewed" || fail "$2: $1 isn't in the reviewed list: $(cat "$reviewed")"; }
+unread() { ! grep -qxF -- "$(sha "$1")" "$reviewed" || fail "$2: $1 is in the reviewed list"; }
+
+# N, n, s: onto the whole change of jail/retry-jitter, then its first commit, split.
+# No key marks anything: a commit is read once its changed lines have been on screen.
 run "$fixture" --script $here/keys.json --at mark:end --snap out/keys.png --theme dark
 run "$fixture" --script $here/keys.json --at mark:end --tree out/keys.json
-[ "$(cat "$reviewed")" = "$(sha 'refs/jail/retry-jitter~2')" ] || fail "keys.json: reviewed list is $(cat "$reviewed")"
+read_ refs/devvm/run-0042 keys.json
+read_ 'refs/jail/retry-jitter~2' keys.json
+unread refs/jail/retry-jitter keys.json
+title_is out/keys.json 'Add jitter to the backoff'
 has out/keys.json 'Clients that fail together retried together'
-has out/keys.json '"Reviewed"'
+split out/keys.json
 
-# Click the last row, click "Mark reviewed", then p: the key must still work after the click.
-run "$fixture" --script $here/click.json --at mark:end --snap out/click.png --theme light
+# Click the last commit of the ref, click the two-column button, then p: the key must still
+# work after the click.
+run "$fixture" --script $here/click.json --at mark:end --snap out/click.png --theme dark
 run "$fixture" --script $here/click.json --at mark:end --tree out/click.json
-[ "$(cat "$reviewed")" = "$(sha refs/jail/retry-jitter)" ] || fail "click.json: reviewed list is $(cat "$reviewed")"
-has out/click.json "$(git -C "$fixture" rev-parse --short 'refs/jail/retry-jitter~1')  ·  jail-agent"
+read_ refs/jail/retry-jitter click.json
+title_is out/click.json 'Saturate instead of overflowing on a long outage'
+split out/click.json
 lacks out/click.json '"focused": true'
 
 run "$fixture" --scene last --tree out/last.json
-has out/last.json 'Speed up CI with a build cache'
+title_is out/last.json 'Speed up CI with a build cache'
 
-# The last ref's commit reaches for the host: its files are listed above the diff with why,
-# and come first in it. With --no-agent nothing is sent. Without it the agent is asked as the
-# diff is shown: a stand-in here, which gets the numbered patch and names files by number.
-printf '#!/bin/sh\ncat > "%s"\nprintf '"'"'FLAG\\t5\\t3\\tSends the cargo credentials file to another host.\\nFLAG\\t3\\t3\\tRuns that script at every build.\\nEND\\n'"'"'\n' "$tmp/agent-saw" > "$agent"
+# The last ref's commit reaches for the host: its files come first in the diff and say why in
+# their headers. With --no-agent nothing is sent. Without it the agent is asked as the diff is
+# shown: a stand-in here, which gets the numbered patch and names files by number. Its note
+# goes on its line, its alarm under its line.
+printf '#!/bin/sh\ncat > "%s"\nprintf '"'"'ALARM\\t5\\t3\\tSends the cargo credentials file to another host.\\nFLAG\\t3\\t3\\tRuns that script at every build.\\nEND\\n'"'"'\n' "$tmp/agent-saw" > "$agent"
 run "$fixture" --no-agent --realtime --script $here/runs.json --at mark:end --snap out/runs.png --theme dark
 run "$fixture" --no-agent --realtime --script $here/runs.json --at mark:end --tree out/runs.json
-has out/runs.json '4 files here would run on this machine'
 has out/runs.json 'cargo runs it at every build'
 has out/runs.json 'direnv runs it on entering the folder'
-lacks out/runs.json 'The agent left'
+lacks out/runs.json 'from the model'
 [ ! -e "$tmp/agent-saw" ] || fail "--no-agent: the agent was asked all the same"
 run "$fixture" --realtime --script $here/runs.json --at mark:end --snap out/agent.png --theme dark
 run "$fixture" --realtime --script $here/runs.json --at mark:end --tree out/agent.json
-has out/agent.json 'The agent left 2 notes'
-has out/agent.json 'scripts/warm-cache.sh:3'
-has out/agent.json 'Sends the cargo credentials file to another host.'
+has out/agent.json '2 notes from the model'
+has out/agent.json 'Alarm: Sends the cargo credentials file to another host.'
+has out/agent.json 'Note: Runs that script at every build.'
 grep -q '^     3 +curl' "$tmp/agent-saw" || fail "the agent wasn't given the patch with its line numbers"
 grep -q '^=== file 5 ===$' "$tmp/agent-saw" || fail "the agent wasn't given the files' numbers"
 quiet
 
-# Taking jail/retry-jitter: refused while unread, then (marked) three signatures and a branch.
+# Taking jail/retry-jitter: refused while its whole change has lines that were never on
+# screen; then, each commit opened and so read, three signatures and a branch.
 # Real time: the signing runs on its own thread, on the wall clock.
-for at in blocked confirm; do
-    run "$fixture" --realtime --script $here/take.json --at mark:$at --tree out/take-$at.json
-done
-has out/take-blocked.json "3 of its 3 commits aren't marked reviewed yet"
-has out/take-confirm.json 'Take jail/retry-jitter as the branch reviewed/jail/retry-jitter?'
-has out/take-confirm.json 'Enter  sign and create the branch'
-[ -z "$(git -C "$fixture" for-each-ref refs/heads/reviewed)" ] || fail "a branch exists before any take was confirmed"
-run "$fixture" --realtime --script $here/take.json --at mark:confirm --snap out/take-confirm.png --theme dark
+run "$fixture" --realtime --script $here/take.json --at mark:blocked --tree out/take-blocked.json
+has out/take-blocked.json 'not been on screen yet'
+[ -z "$(git -C "$fixture" for-each-ref refs/heads/reviewed)" ] || fail "a refused take made a branch"
 run "$fixture" --realtime --script $here/take.json --at mark:end --tree out/take-end.json
-has out/take-end.json 'Branch reviewed/jail/retry-jitter created'
+has out/take-end.json 'Switch to it'
 taken=refs/heads/reviewed/jail/retry-jitter
 [ "$(git -C "$fixture" rev-parse "$taken^{tree}")" = "$(git -C "$fixture" rev-parse 'refs/jail/retry-jitter^{tree}')" ] || fail "the taken branch's files differ from the ref's"
 [ "$(git -C "$fixture" rev-list --count "main..$taken")" = 3 ] || fail "the taken branch isn't three commits on main"
@@ -105,6 +115,11 @@ for c in $(git -C "$fixture" rev-list "main..$taken"); do
 done
 [ "$(git -C "$fixture" symbolic-ref HEAD)" = refs/heads/main ] || fail "the take moved HEAD"
 [ -z "$(git -C "$fixture" status --porcelain)" ] || fail "the take touched the working tree"
+# The window on a taken ref: the branch is drawn, with the way onto it.
+KEEP_STATE=1 run "$fixture" --realtime --script $here/take.json --at mark:blocked --snap out/taken.png --theme dark
+KEEP_STATE=1 run "$fixture" --realtime --script $here/take.json --at mark:blocked --tree out/taken.json
+has out/taken.json 'Switch to it'
+lacks out/taken.json 'Take 3 commits'
 # Once more with a signer that takes its time: the still catches a signature being waited for.
 git -C "$fixture" update-ref -d "$taken"
 slowsign="$tmp/slowsign.sh"
@@ -115,7 +130,7 @@ export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=gpg.ssh.program GIT_CONFIG_VALUE_0="$
 run "$fixture" --realtime --script $here/take.json --at mark:signing --snap out/take-signing.png --theme dark
 run "$fixture" --realtime --script $here/take.json --at mark:signing --tree out/take-signing.json
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
-has out/take-signing.json 'Signature 1 of 3: touch your key'
+has out/take-signing.json 'Touch your key'
 [ -z "$(git -C "$fixture" for-each-ref refs/heads/reviewed)" ] || fail "a take that was cut off left a branch"
 
 run "$tmp" --snap out/not-a-repo.png --theme dark
@@ -138,7 +153,7 @@ for at in early end; do
     REFVIEW_WAIT= PATH="$slow:$PATH" run "$fixture" --realtime --script $here/slow.json --at mark:$at --tree out/slow-$at.json
 done
 has out/slow-early.json 'Reading'
-lacks out/slow-early.json '"4 files"'
-has out/slow-end.json '"4 files"'
+lacks out/slow-early.json 'src/backoff.rs'
+has out/slow-end.json 'src/backoff.rs'
 lacks out/slow-end.json 'Reading'
 echo "headless checks ok"

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Builds a small repository with sandbox-style refs to try refview on:
 #   scripts/fixture.sh /tmp/refview-fixture && cargo run -- /tmp/refview-fixture
+# With --own-key the repository gets no signing key of its own, so a take there signs with
+# yours (and asks for a touch, if yours is a hardware key).
 # Dates and authors are fixed, so the commit hashes (and headless snapshots) repeat.
 # Needs GNU sed (`sed -i`).
 set -euo pipefail
-dir=${1:?usage: fixture.sh DIR}
+dir=${1:?usage: fixture.sh DIR [--own-key]}
+own_key=${2:-}
 # Nothing inherited may point git somewhere other than DIR, or change what it writes there.
 unset $(git rev-parse --local-env-vars)
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
@@ -138,10 +141,12 @@ git update-ref refs/jail/merged-already HEAD
 git branch -q -D work vm cache
 
 # Taking a ref signs its copies. Give this repository a throwaway software key for that, so
-# a take here never asks for yours.
-ssh-keygen -q -t ed25519 -N "" -C refview-fixture -f .git/refview-fixture-key
-git config user.name Reader
-git config user.email reader@example.invalid
-git config gpg.format ssh
-git config user.signingkey "$PWD/.git/refview-fixture-key"
+# a take here never asks for yours, unless that is what was asked for.
+if [ "$own_key" != --own-key ]; then
+    ssh-keygen -q -t ed25519 -N "" -C refview-fixture -f .git/refview-fixture-key
+    git config user.name Reader
+    git config user.email reader@example.invalid
+    git config gpg.format ssh
+    git config user.signingkey "$PWD/.git/refview-fixture-key"
+fi
 echo "$dir"

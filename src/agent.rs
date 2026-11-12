@@ -7,7 +7,8 @@
 //! - The model gets no tools. The worst a patch can make it do is say nothing or say something
 //!   false.
 //! - Its findings only ever add marks. Nothing here clears a file, and "nothing flagged" is
-//!   shown as that, never as "safe". The reviewed marks and the take gate don't read this.
+//!   shown as that, never as "safe". The read marks don't look at this, and the take gate
+//!   only waits for a first reply to the diff on screen, whatever it says.
 //! - Its reply is data: lines of a fixed shape, each naming a file by its number in the patch
 //!   and a line the patch shows. The text of a finding is drawn as text, nothing more.
 //!
@@ -58,6 +59,11 @@ new version starts with its line number in the new file.
 
 Reply with one line per finding, most serious first, and nothing else:
 FLAG<TAB>N<TAB>line<TAB>one sentence saying what it does and why that matters
+Start the line with ALARM instead of FLAG when the finding looks like deliberate harm, \
+something the person should refuse outright: credentials, keys or private data read and sent \
+anywhere, a hidden or encoded payload, a download that is then run, code written to look like \
+something other than what it does. Most patches have no ALARM line; a build script that only \
+builds is a FLAG.
 `N` is the file's number from its `=== file N ===` line. `line` is the new-file line number \
 the finding is about, or 0 for the file as a whole. Use real tab characters. After the last \
 finding, or straight away when there is nothing to report, write a line with only END.";
@@ -69,6 +75,8 @@ pub struct Finding {
     /// The line in the new file, or 0 for the file as a whole.
     pub line: u32,
     pub why: String,
+    /// The model called it deliberate harm, not just something to look at.
+    pub alarm: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -136,7 +144,7 @@ pub fn parse(reply: &str, lines: &[BTreeSet<u32>]) -> Report {
             break;
         }
         let mut parts = line.splitn(4, '\t');
-        let (Some("FLAG"), Some(file), Some(at), Some(why)) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
+        let (Some(level @ ("FLAG" | "ALARM")), Some(file), Some(at), Some(why)) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
         let Some(file) = file.trim().parse::<usize>().ok().and_then(|n| n.checked_sub(1)).filter(|&n| n < lines.len()) else { continue };
         let at = at.trim().parse().ok().filter(|n| lines[file].contains(n)).unwrap_or(0);
         let why: String = why.trim().chars().filter(|c| !c.is_control()).take(MAX_WHY).collect();
@@ -147,7 +155,7 @@ pub fn parse(reply: &str, lines: &[BTreeSet<u32>]) -> Report {
             report.dropped += 1;
             continue;
         }
-        report.findings.push(Finding { file, line: at, why });
+        report.findings.push(Finding { file, line: at, why, alarm: level == "ALARM" });
     }
     if all.any(|l| !l.trim().is_empty()) {
         report.complete = false;
@@ -178,19 +186,24 @@ impl Agent {
             return Err(format!("this diff is {} KB; more than {} KB isn't sent", n.text.len() / 1000, MAX_PATCH / 1000));
         }
         let kept = self.cache.as_ref().and_then(|dir| Some(dir.join(key(&n.text)?)));
-        if !fresh && let Some(reply) = kept.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
-            let report = parse(&reply, &n.lines);
-            if report.complete {
-                return Ok(report);
-            }
+        let earlier = kept.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).filter(|reply| parse(reply, &n.lines).complete);
+        if !fresh && let Some(reply) = &earlier {
+            return Ok(parse(reply, &n.lines));
         }
         let reply = self.converse(&n.text)?;
         let report = parse(&reply, &n.lines);
         // Only a reply that ended properly is worth keeping: a cut one should be asked again.
-        if report.complete && let Some(path) = &kept {
-            keep(path, &reply);
+        if !report.complete {
+            return Ok(report);
         }
-        Ok(report)
+        // What an earlier look found is kept with the new one: a second look only adds, in
+        // the next run as in this one.
+        let before: String = earlier.iter().flat_map(|old| old.lines()).filter(|l| l.trim() != "END" && !reply.lines().any(|new| new == *l)).map(|l| format!("{l}\n")).collect();
+        let both = format!("{before}{reply}");
+        if let Some(path) = &kept {
+            keep(path, &both);
+        }
+        Ok(parse(&both, &n.lines))
     }
 
     fn converse(&self, input: &str) -> Result<String, String> {
@@ -311,9 +324,9 @@ END\n";
         assert_eq!(
             report.findings,
             [
-                Finding { file: 0, line: 2, why: "Runs curl at build time.".into() },
-                Finding { file: 1, line: 0, why: "A line the patch doesn't show.".into() },
-                Finding { file: 0, line: 0, why: "Whole file[31m.".into() },
+                Finding { file: 0, line: 2, why: "Runs curl at build time.".into(), alarm: false },
+                Finding { file: 1, line: 0, why: "A line the patch doesn't show.".into(), alarm: false },
+                Finding { file: 0, line: 0, why: "Whole file[31m.".into(), alarm: false },
             ]
         );
     }
